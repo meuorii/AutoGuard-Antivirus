@@ -1,0 +1,1 @@
+"""AutoGuard: file observation, threat tracking, and recovery foundations."""
