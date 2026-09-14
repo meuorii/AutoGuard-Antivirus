@@ -1,44 +1,28 @@
-import errno
-import os
-import stat
-from dataclasses import replace
-from pathlib import Path
-from typing import Iterator, Literal
-
-from app.config import DEFAULT_MAX_FILE_SIZE_BYTES
-from app.detection_rules import SCRIPT_EXTENSIONS
-from app.detector import SCRIPT_PREVIEW_BYTES, Detector
-from app.hashing import FileTooLargeError, UnsupportedFileError, inspect_file, is_link_or_reparse, normalize_path
-from app.incidents import IncidentService
-from app.models import DetectionStatus, EntryKind, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType
-from app.quarantine import QuarantineService
-from app.scan_history import ScanHistory, ScanHistoryError
-from app.threat_trail import ThreatTrail
+import errno, os, stat; from dataclasses import replace; from pathlib import Path; from typing import Iterator, Literal
+from app.config import DEFAULT_MAX_FILE_SIZE_BYTES; from app.detection_rules import SCRIPT_EXTENSIONS; from app.detector import SCRIPT_PREVIEW_BYTES, Detector
+from app.hashing import FileTooLargeError, UnsupportedFileError, inspect_file, is_link_or_reparse, normalize_path; from app.incidents import IncidentService
+from app.matching_cleanup import MatchingCleanupResult, MatchingCopyCleanup; from app.quarantine import QuarantineService
+from app.models import DetectionStatus, EntryKind, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType; from app.scan_history import ScanHistory, ScanHistoryError; from app.threat_trail import ThreatTrail
 
 ScanMode = Literal["auto", "file", "directory"]
 
-
 class Scanner:
-    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None, quarantine: QuarantineService | None = None) -> None:
+    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None, quarantine: QuarantineService | None = None, matching_cleanup: MatchingCopyCleanup | None = None) -> None:
         if type(max_file_size_bytes) is not int or max_file_size_bytes < 0: raise ValueError("max_file_size_bytes must be a nonnegative integer.")
         self.detector, self.threat_trail, self.max_file_size_bytes = detector, threat_trail, max_file_size_bytes
         self.history = history if history is not None else ScanHistory(threat_trail.database)
         self.incidents = incidents if incidents is not None else IncidentService(threat_trail.database)
-        self.quarantine, self._quarantine_dir = quarantine, normalize_path(quarantine.quarantine_dir) if quarantine is not None else None
-        self._database_files = {normalize_path(str(db.path) + sfx) for db in (threat_trail.database, self.history.database) for sfx in ("", "-wal", "-shm", "-journal")}
+        self.quarantine, self.matching_cleanup, self.last_matching_cleanup_results = quarantine, matching_cleanup, ()
+        self._quarantine_dir = normalize_path(quarantine.quarantine_dir) if quarantine is not None else None
+        self._database_files = {normalize_path(str(database.path) + suffix) for database in (threat_trail.database, self.history.database) for suffix in ("", "-wal", "-shm", "-journal")}
 
-    def scan_file(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanResult:
-        return self._run(path, source, scan_type, "file").results[0]
-
-    def scan(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary:
-        return self._run(path, source, scan_type, "auto")
-
-    def scan_directory(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary:
-        return self._run(path, source, scan_type, "directory")
+    def scan_file(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanResult: return self._run(path, source, scan_type, "file").results[0]
+    def scan(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "auto")
+    def scan_directory(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "directory")
 
     def _run(self, path: str | Path, source: ScanSource | None, scan_type: ScanType | None, mode: ScanMode) -> ScanSummary:
-        if scan_type is None: source, scan_type = ScanSource.MANUAL if source is None else ScanSource(source), ScanType.from_source(ScanSource.MANUAL if source is None else ScanSource(source))
-        else: scan_type, source = ScanType(scan_type), scan_type.default_source if source is None else ScanSource(source)
+        if scan_type is None: source = ScanSource.MANUAL if source is None else ScanSource(source); scan_type = ScanType.from_source(source)
+        else: scan_type = ScanType(scan_type); source = scan_type.default_source if source is None else ScanSource(source)
         root = normalize_path(path)
         try: session = self.history.start_session(scan_type, root, source)
         except Exception as error: raise ScanHistoryError(f"Could not start scan history: {type(error).__name__}: {error}") from error
@@ -56,13 +40,22 @@ class Scanner:
                 raise ScanHistoryError(f"{detail}; could not finalize history: {finish_error}", session.id) from finish_error
             if stage != "processing" and isinstance(error, Exception): raise ScanHistoryError(detail, session.id) from error
             raise
+        cleanup_results = []
+        if self.matching_cleanup is not None:
+            active_by_hash = {item.sha256: item.id for item in self.incidents.get_active_incidents()}
+            dangerous_hashes = {result.detection.sha256 for result in results if result.detection is not None and result.detection.status is DetectionStatus.HIGH_CONFIDENCE}
+            for sha256 in dangerous_hashes:
+                if (incident_id := active_by_hash.get(sha256)) is not None: cleanup_results.append(self.matching_cleanup.cleanup_incident(incident_id))
+        self.last_matching_cleanup_results = tuple(cleanup_results)
         return ScanSummary(tuple(results), session.id)
 
     def _iter_scan(self, root: Path, source: ScanSource, mode: ScanMode) -> Iterator[ScanResult]:
         try: info = root.lstat()
         except OSError as error: yield self._failure(root, error, "unknown"); return
         directory = stat.S_ISDIR(info.st_mode) and not is_link_or_reparse(info)
-        if mode == "directory" and not directory: yield ScanResult(str(root), ScanStatus.SKIPPED_UNSUPPORTED, "Expected a regular directory, not a file or link/reparse point.", "directory" if stat.S_ISDIR(info.st_mode) else "file")
+        if mode == "directory" and not directory:
+            kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
+            yield ScanResult(str(root), ScanStatus.SKIPPED_UNSUPPORTED, "Expected a regular directory, not a file or link/reparse point.", kind)
         elif mode != "file" and directory: yield from self._iter_directory(root, source)
         else: yield self._process_file(root, info, source)
 
