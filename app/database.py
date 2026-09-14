@@ -74,6 +74,48 @@ CREATE TABLE IF NOT EXISTS scan_results (
 
 CREATE INDEX IF NOT EXISTS idx_scan_sessions_started ON scan_sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_results_session ON scan_results(session_id, id);
+
+CREATE TABLE IF NOT EXISTS threat_incidents (
+    id TEXT PRIMARY KEY NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    status TEXT NOT NULL CHECK (status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
+    first_observed_path TEXT NOT NULL CHECK (length(first_observed_path) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL CHECK (updated_at >= created_at),
+    last_observed_at TEXT NOT NULL CHECK (last_observed_at >= created_at),
+    detection_count INTEGER NOT NULL DEFAULT 1 CHECK (detection_count >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS incident_files (
+    id INTEGER PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
+    path TEXT NOT NULL CHECK (length(path) > 0),
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL CHECK (last_seen >= first_seen),
+    seen_count INTEGER NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
+    first_source TEXT NOT NULL CHECK (first_source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
+    last_source TEXT NOT NULL CHECK (last_source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
+    first_detection_reason TEXT NOT NULL CHECK (length(first_detection_reason) > 0),
+    last_detection_reason TEXT NOT NULL CHECK (length(last_detection_reason) > 0),
+    UNIQUE (incident_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS incident_events (
+    id INTEGER PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('FIRST_OBSERVED', 'MATCHING_LOCATION_OBSERVED', 'REPEATED_DETECTION', 'STATUS_CHANGED')),
+    occurred_at TEXT NOT NULL,
+    path TEXT,
+    source TEXT CHECK (source IS NULL OR source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
+    detection_reason TEXT,
+    old_status TEXT CHECK (old_status IS NULL OR old_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
+    new_status TEXT CHECK (new_status IS NULL OR new_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
+    CHECK ((event_type = 'STATUS_CHANGED' AND old_status IS NOT NULL AND new_status IS NOT NULL) OR (event_type <> 'STATUS_CHANGED' AND path IS NOT NULL AND source IS NOT NULL AND detection_reason IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_incident_sha256 ON threat_incidents(sha256) WHERE status <> 'RESOLVED';
+CREATE INDEX IF NOT EXISTS idx_incident_files_incident ON incident_files(incident_id, first_seen, id);
+CREATE INDEX IF NOT EXISTS idx_incident_events_timeline ON incident_events(incident_id, occurred_at, id);
 """
 
 class Database:
@@ -87,8 +129,7 @@ class Database:
     def connection(self) -> Iterator[sqlite3.Connection]:
         """Commit on success, roll back on error, and always close."""
         with closing(sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
+            connection.row_factory = sqlite3.Row; connection.execute("PRAGMA foreign_keys = ON")
             with connection: yield connection
 
     def initialize(self) -> None:
