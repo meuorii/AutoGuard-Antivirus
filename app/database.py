@@ -1,4 +1,7 @@
-import sqlite3; from contextlib import closing, contextmanager; from pathlib import Path; from typing import Iterator
+import sqlite3
+from contextlib import closing, contextmanager
+from pathlib import Path
+from typing import Iterator
 from app.config import SQLITE_TIMEOUT_SECONDS
 
 SCHEMA = """
@@ -53,7 +56,10 @@ CREATE TABLE IF NOT EXISTS scan_results (
     entry_kind TEXT NOT NULL CHECK (entry_kind IN ('file', 'directory', 'unknown')),
     detection_status TEXT CHECK (detection_status IN ('NO_DETECTION', 'LOW_CONFIDENCE', 'HIGH_CONFIDENCE')),
     detection_confidence REAL CHECK (detection_confidence BETWEEN 0.0 AND 1.0),
-    rule_name TEXT, reason TEXT NOT NULL, detection_reason TEXT, matched_signature_name TEXT,
+    rule_name TEXT,
+    reason TEXT NOT NULL,
+    detection_reason TEXT,
+    matched_signature_name TEXT,
     matched_signature_kind TEXT CHECK (matched_signature_kind IN ('known_malicious', 'autoguard_test')),
     recorded_at TEXT NOT NULL,
     CHECK ((detection_status IS NULL AND detection_confidence IS NULL AND rule_name IS NULL AND detection_reason IS NULL) OR (detection_status IS NOT NULL AND detection_confidence IS NOT NULL AND rule_name IS NOT NULL AND detection_reason IS NOT NULL AND sha256 IS NOT NULL)),
@@ -67,7 +73,8 @@ CREATE TABLE IF NOT EXISTS threat_incidents (
     sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
     status TEXT NOT NULL CHECK (status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
     first_observed_path TEXT NOT NULL CHECK (length(first_observed_path) > 0),
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL CHECK (updated_at >= created_at),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL CHECK (updated_at >= created_at),
     last_observed_at TEXT NOT NULL CHECK (last_observed_at >= created_at),
     detection_count INTEGER NOT NULL DEFAULT 1 CHECK (detection_count >= 1)
 );
@@ -75,7 +82,8 @@ CREATE TABLE IF NOT EXISTS incident_files (
     id INTEGER PRIMARY KEY,
     incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
     path TEXT NOT NULL CHECK (length(path) > 0),
-    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL CHECK (last_seen >= first_seen),
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL CHECK (last_seen >= first_seen),
     seen_count INTEGER NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
     first_source TEXT NOT NULL CHECK (first_source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
     last_source TEXT NOT NULL CHECK (last_source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
@@ -86,8 +94,9 @@ CREATE TABLE IF NOT EXISTS incident_files (
 CREATE TABLE IF NOT EXISTS incident_events (
     id INTEGER PRIMARY KEY,
     incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
-    event_type TEXT NOT NULL CHECK (event_type IN ('FIRST_OBSERVED', 'MATCHING_LOCATION_OBSERVED', 'REPEATED_DETECTION', 'STATUS_CHANGED', 'QUARANTINE_STARTED', 'QUARANTINE_SUCCEEDED', 'QUARANTINE_FAILED', 'QUARANTINE_INTEGRITY_FAILED', 'MATCHING_CLEANUP_STARTED', 'MATCHING_COPY_FOUND', 'MATCHING_COPY_QUARANTINED', 'MATCHING_COPY_ALREADY_CONTAINED', 'MATCHING_CLEANUP_FAILED', 'MATCHING_CLEANUP_FINISHED')),
-    occurred_at TEXT NOT NULL, path TEXT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('FIRST_OBSERVED', 'MATCHING_LOCATION_OBSERVED', 'REPEATED_DETECTION', 'STATUS_CHANGED', 'QUARANTINE_STARTED', 'QUARANTINE_SUCCEEDED', 'QUARANTINE_FAILED', 'QUARANTINE_INTEGRITY_FAILED', 'MATCHING_CLEANUP_STARTED', 'MATCHING_COPY_FOUND', 'MATCHING_COPY_QUARANTINED', 'MATCHING_COPY_ALREADY_CONTAINED', 'MATCHING_CLEANUP_FAILED', 'MATCHING_CLEANUP_FINISHED', 'CLEANUP_VERIFICATION_STARTED', 'CLEANUP_VERIFIED', 'CLEANUP_VERIFICATION_PARTIAL', 'CLEANUP_VERIFICATION_FAILED')),
+    occurred_at TEXT NOT NULL,
+    path TEXT,
     source TEXT CHECK (source IS NULL OR source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
     detection_reason TEXT,
     old_status TEXT CHECK (old_status IS NULL OR old_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
@@ -104,19 +113,38 @@ CREATE TABLE IF NOT EXISTS quarantine_items (
     stored_path TEXT NOT NULL UNIQUE CHECK (length(stored_path) > 0),
     sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
     original_size INTEGER CHECK (original_size IS NULL OR original_size >= 0),
-    created_at TEXT NOT NULL, quarantined_at TEXT,
+    created_at TEXT NOT NULL,
+    quarantined_at TEXT,
     reason TEXT NOT NULL CHECK (length(reason) > 0),
     original_source TEXT NOT NULL CHECK (original_source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
     state TEXT NOT NULL CHECK (state IN ('PENDING', 'QUARANTINED', 'FAILED')),
     integrity_status TEXT NOT NULL CHECK (integrity_status IN ('PENDING', 'VERIFIED', 'FAILED')),
     verified_sha256 TEXT CHECK (verified_sha256 IS NULL OR (length(verified_sha256) = 64 AND verified_sha256 NOT GLOB '*[^0-9a-f]*')),
     verified_size INTEGER CHECK (verified_size IS NULL OR verified_size >= 0),
-    verified_at TEXT, original_removed INTEGER NOT NULL DEFAULT 0 CHECK (original_removed IN (0, 1)),
+    verified_at TEXT,
+    original_removed INTEGER NOT NULL DEFAULT 0 CHECK (original_removed IN (0, 1)),
     failure_reason TEXT,
     CHECK (state <> 'QUARANTINED' OR (integrity_status = 'VERIFIED' AND quarantined_at IS NOT NULL AND original_removed = 1 AND verified_sha256 = sha256))
 );
 CREATE INDEX IF NOT EXISTS idx_quarantine_incident ON quarantine_items(incident_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_quarantine_success_identity ON quarantine_items(incident_id, original_path, sha256, state);
+CREATE TABLE IF NOT EXISTS cleanup_verifications (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'PARTIAL', 'FAILED')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL CHECK (finished_at >= started_at),
+    locations_searched INTEGER NOT NULL CHECK (locations_searched >= 0),
+    quarantined_copies INTEGER NOT NULL CHECK (quarantined_copies >= 0),
+    verified_quarantine_objects INTEGER NOT NULL CHECK (verified_quarantine_objects >= 0),
+    remaining_matching_copies INTEGER NOT NULL CHECK (remaining_matching_copies >= 0),
+    inaccessible_locations INTEGER NOT NULL CHECK (inaccessible_locations >= 0),
+    verification_errors INTEGER NOT NULL CHECK (verification_errors >= 0),
+    details_json TEXT NOT NULL CHECK (length(details_json) > 0),
+    CHECK (verified_quarantine_objects <= quarantined_copies)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_verifications_incident ON cleanup_verifications(incident_id, started_at, id);
 """
 
 class Database:
@@ -128,16 +156,19 @@ class Database:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         """Commit on success, roll back on error, and always close."""
-        with closing(sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)) as connection:
-            connection.row_factory = sqlite3.Row; connection.execute("PRAGMA foreign_keys = ON")
-            with connection: yield connection
+        with closing(sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
+            conn.row_factory = sqlite3.Row; conn.execute("PRAGMA foreign_keys = ON")
+            with conn: yield conn
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connection() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
-            _migrate_incident_events_for_phase6(connection); _migrate_incident_events_for_phase7(connection); _migrate_quarantine_index_for_phase7(connection)
+        with self.connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+            _migrate_incident_events_for_phase6(conn)
+            _migrate_incident_events_for_phase7(conn)
+            _migrate_incident_events_for_phase8(conn)
+            _migrate_quarantine_index_for_phase7(conn)
 
 def _migrate_incident_events_for_phase6(connection: sqlite3.Connection) -> None:
     """Upgrade Phase 5 incident_events CHECK constraints in existing databases."""
@@ -151,7 +182,7 @@ def _migrate_incident_events_for_phase6(connection: sqlite3.Connection) -> None:
         new_status TEXT CHECK (new_status IS NULL OR new_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
         CHECK ((event_type = 'STATUS_CHANGED' AND old_status IS NOT NULL AND new_status IS NOT NULL) OR (event_type <> 'STATUS_CHANGED' AND path IS NOT NULL AND source IS NOT NULL AND detection_reason IS NOT NULL))
     )""")
-    connection.execute("INSERT INTO incident_events_phase6 (id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status) SELECT id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status FROM incident_events")
+    connection.execute("INSERT INTO incident_events_phase6 SELECT id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status FROM incident_events")
     connection.execute("DROP TABLE incident_events"); connection.execute("ALTER TABLE incident_events_phase6 RENAME TO incident_events")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_timeline ON incident_events(incident_id, occurred_at, id)")
 
@@ -167,8 +198,24 @@ def _migrate_incident_events_for_phase7(connection: sqlite3.Connection) -> None:
         new_status TEXT CHECK (new_status IS NULL OR new_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
         CHECK ((event_type = 'STATUS_CHANGED' AND old_status IS NOT NULL AND new_status IS NOT NULL) OR (event_type <> 'STATUS_CHANGED' AND path IS NOT NULL AND source IS NOT NULL AND detection_reason IS NOT NULL))
     )""")
-    connection.execute("INSERT INTO incident_events_phase7 (id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status) SELECT id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status FROM incident_events")
+    connection.execute("INSERT INTO incident_events_phase7 SELECT id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status FROM incident_events")
     connection.execute("DROP TABLE incident_events"); connection.execute("ALTER TABLE incident_events_phase7 RENAME TO incident_events")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_timeline ON incident_events(incident_id, occurred_at, id)")
+
+def _migrate_incident_events_for_phase8(connection: sqlite3.Connection) -> None:
+    """Upgrade Phase 7 incident event constraints for cleanup verification."""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'incident_events'").fetchone()
+    if row is None or "CLEANUP_VERIFICATION_FAILED" in (row["sql"] or ""): return
+    connection.execute("""CREATE TABLE incident_events_phase8 (
+        id INTEGER PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT,
+        event_type TEXT NOT NULL CHECK (event_type IN ('FIRST_OBSERVED', 'MATCHING_LOCATION_OBSERVED', 'REPEATED_DETECTION', 'STATUS_CHANGED', 'QUARANTINE_STARTED', 'QUARANTINE_SUCCEEDED', 'QUARANTINE_FAILED', 'QUARANTINE_INTEGRITY_FAILED', 'MATCHING_CLEANUP_STARTED', 'MATCHING_COPY_FOUND', 'MATCHING_COPY_QUARANTINED', 'MATCHING_COPY_ALREADY_CONTAINED', 'MATCHING_CLEANUP_FAILED', 'MATCHING_CLEANUP_FINISHED', 'CLEANUP_VERIFICATION_STARTED', 'CLEANUP_VERIFIED', 'CLEANUP_VERIFICATION_PARTIAL', 'CLEANUP_VERIFICATION_FAILED')),
+        occurred_at TEXT NOT NULL, path TEXT, source TEXT CHECK (source IS NULL OR source IN ('manual', 'startup', 'scheduled', 'file_monitor', 'usb', 'matching_copy', 'recovery')),
+        detection_reason TEXT, old_status TEXT CHECK (old_status IS NULL OR old_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
+        new_status TEXT CHECK (new_status IS NULL OR new_status IN ('OPEN', 'INVESTIGATING', 'CONTAINED', 'REAPPEARED', 'RESTORED', 'RESOLVED')),
+        CHECK ((event_type = 'STATUS_CHANGED' AND old_status IS NOT NULL AND new_status IS NOT NULL) OR (event_type <> 'STATUS_CHANGED' AND path IS NOT NULL AND source IS NOT NULL AND detection_reason IS NOT NULL))
+    )""")
+    connection.execute("INSERT INTO incident_events_phase8 SELECT id, incident_id, event_type, occurred_at, path, source, detection_reason, old_status, new_status FROM incident_events")
+    connection.execute("DROP TABLE incident_events"); connection.execute("ALTER TABLE incident_events_phase8 RENAME TO incident_events")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_timeline ON incident_events(incident_id, occurred_at, id)")
 
 def _migrate_quarantine_index_for_phase7(connection: sqlite3.Connection) -> None:
