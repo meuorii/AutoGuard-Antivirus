@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "signatures": [
+    {
+      "name": "AutoGuard.Harmless.Test",
+      "sha256": "b2d5147202f6647c7c71de02b1c874b78dc8956a6d13147644f443ceb82d88ff",
+      "kind": "autoguard_test",
+      "description": "Harmless AutoGuard test content with one trailing LF newline; not malware."
+    }
+  ]
+}
