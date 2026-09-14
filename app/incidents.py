@@ -1,9 +1,3 @@
-"""Threat incidents grouped by identical malicious content (SHA-256).
-
-Incidents record observations, status transitions, quarantine events, matching-copy cleanup, cleanup verification, and Phase 9 reappearance evidence.
-Restore remains outside this phase.
-"""
-
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,11 +11,16 @@ from app.models import DetectionResult, DetectionStatus, ScanSource
 
 
 class IncidentStatus(str, Enum):
-    OPEN = "OPEN"; INVESTIGATING = "INVESTIGATING"; CONTAINED = "CONTAINED"; REAPPEARED = "REAPPEARED"; RESTORED = "RESTORED"; RESOLVED = "RESOLVED"
+    OPEN, INVESTIGATING, CONTAINED, REAPPEARED, RESTORED, RESOLVED = "OPEN", "INVESTIGATING", "CONTAINED", "REAPPEARED", "RESTORED", "RESOLVED"
 
 
 class IncidentEventType(str, Enum):
-    FIRST_OBSERVED = "FIRST_OBSERVED"; MATCHING_LOCATION_OBSERVED = "MATCHING_LOCATION_OBSERVED"; REPEATED_DETECTION = "REPEATED_DETECTION"; STATUS_CHANGED = "STATUS_CHANGED"; QUARANTINE_STARTED = "QUARANTINE_STARTED"; QUARANTINE_SUCCEEDED = "QUARANTINE_SUCCEEDED"; QUARANTINE_FAILED = "QUARANTINE_FAILED"; QUARANTINE_INTEGRITY_FAILED = "QUARANTINE_INTEGRITY_FAILED"; MATCHING_CLEANUP_STARTED = "MATCHING_CLEANUP_STARTED"; MATCHING_COPY_FOUND = "MATCHING_COPY_FOUND"; MATCHING_COPY_QUARANTINED = "MATCHING_COPY_QUARANTINED"; MATCHING_COPY_ALREADY_CONTAINED = "MATCHING_COPY_ALREADY_CONTAINED"; MATCHING_CLEANUP_FAILED = "MATCHING_CLEANUP_FAILED"; MATCHING_CLEANUP_FINISHED = "MATCHING_CLEANUP_FINISHED"; CLEANUP_VERIFICATION_STARTED = "CLEANUP_VERIFICATION_STARTED"; CLEANUP_VERIFIED = "CLEANUP_VERIFIED"; CLEANUP_VERIFICATION_PARTIAL = "CLEANUP_VERIFICATION_PARTIAL"; CLEANUP_VERIFICATION_FAILED = "CLEANUP_VERIFICATION_FAILED"; REAPPEARANCE = "REAPPEARANCE"
+    FIRST_OBSERVED, MATCHING_LOCATION_OBSERVED, REPEATED_DETECTION, STATUS_CHANGED = "FIRST_OBSERVED", "MATCHING_LOCATION_OBSERVED", "REPEATED_DETECTION", "STATUS_CHANGED"
+    QUARANTINE_STARTED, QUARANTINE_SUCCEEDED, QUARANTINE_FAILED, QUARANTINE_INTEGRITY_FAILED = "QUARANTINE_STARTED", "QUARANTINE_SUCCEEDED", "QUARANTINE_FAILED", "QUARANTINE_INTEGRITY_FAILED"
+    MATCHING_CLEANUP_STARTED, MATCHING_COPY_FOUND, MATCHING_COPY_QUARANTINED = "MATCHING_CLEANUP_STARTED", "MATCHING_COPY_FOUND", "MATCHING_COPY_QUARANTINED"
+    MATCHING_COPY_ALREADY_CONTAINED, MATCHING_CLEANUP_FAILED, MATCHING_CLEANUP_FINISHED = "MATCHING_COPY_ALREADY_CONTAINED", "MATCHING_CLEANUP_FAILED", "MATCHING_CLEANUP_FINISHED"
+    CLEANUP_VERIFICATION_STARTED, CLEANUP_VERIFIED, CLEANUP_VERIFICATION_PARTIAL, CLEANUP_VERIFICATION_FAILED = "CLEANUP_VERIFICATION_STARTED", "CLEANUP_VERIFIED", "CLEANUP_VERIFICATION_PARTIAL", "CLEANUP_VERIFICATION_FAILED"
+    REAPPEARANCE, RECOVERY_ATTEMPTED, RECOVERY_CONFLICT, RECOVERY_BLOCKED, RECOVERY_FAILED, RECOVERY_SUCCEEDED = "REAPPEARANCE", "RECOVERY_ATTEMPTED", "RECOVERY_CONFLICT", "RECOVERY_BLOCKED", "RECOVERY_FAILED", "RECOVERY_SUCCEEDED"
 
 
 @dataclass(frozen=True)
@@ -71,8 +70,7 @@ class IncidentService:
     def __init__(self, database: Database) -> None: self.database = database
 
     def create_incident(self, sha256: str, path: str | Path, source: ScanSource, detection_reason: str) -> ThreatIncident:
-        """Create one OPEN incident with its first observed location."""
-        sha256 = _sha256(sha256); path = str(normalize_path(path)); source = ScanSource(source)
+        sha256, path, source = _sha256(sha256), str(normalize_path(path)), ScanSource(source)
         if not detection_reason: raise ValueError("detection_reason must not be empty.")
         incident_id, now = str(uuid4()), _utc_now()
         with self.database.connection() as connection:
@@ -84,8 +82,7 @@ class IncidentService:
         return _incident(row)
 
     def attach_matching_file(self, incident_id: str, path: str | Path, source: ScanSource, detection_reason: str) -> IncidentFile:
-        """Attach or refresh an observed location and append its detection event."""
-        path = str(normalize_path(path)); source = ScanSource(source)
+        path, source = str(normalize_path(path)), ScanSource(source)
         if not detection_reason: raise ValueError("detection_reason must not be empty.")
         now = _utc_now()
         with self.database.connection() as connection:
@@ -100,10 +97,7 @@ class IncidentService:
         return _file(row)
 
     def append_event(self, incident_id: str, event_type: IncidentEventType, *, path: str | Path | None = None, source: ScanSource | None = None, detection_reason: str | None = None, old_status: IncidentStatus | None = None, new_status: IncidentStatus | None = None, reappearance_count: int | None = None) -> IncidentEvent:
-        """Append a timeline event without changing incident/file counters."""
-        event_type = IncidentEventType(event_type)
-        normalized_path = str(normalize_path(path)) if path is not None else None
-        normalized_source = ScanSource(source) if source is not None else None
+        event_type, normalized_path, normalized_source = IncidentEventType(event_type), str(normalize_path(path)) if path is not None else None, ScanSource(source) if source is not None else None
         old, new = IncidentStatus(old_status) if old_status is not None else None, IncidentStatus(new_status) if new_status is not None else None
         if reappearance_count is not None and (type(reappearance_count) is not int or reappearance_count < 1): raise ValueError("reappearance_count must be a positive integer or None.")
         now = _utc_now()
@@ -115,7 +109,6 @@ class IncidentService:
         return _event(row)
 
     def get_incident(self, incident_id: str) -> IncidentDetails | None:
-        """Return the incident plus all known locations and ordered timeline events."""
         with self.database.connection() as connection:
             connection.execute("BEGIN")
             row = connection.execute("SELECT * FROM threat_incidents WHERE id = ?", (incident_id,)).fetchone()
@@ -125,13 +118,11 @@ class IncidentService:
         return IncidentDetails(incident=_incident(row), files=tuple(_file(item) for item in files), events=tuple(_event(item) for item in events))
 
     def get_active_incidents(self) -> list[ThreatIncident]:
-        """Return every non-RESOLVED incident, newest observation first."""
         with self.database.connection() as connection:
             rows = connection.execute("SELECT * FROM threat_incidents WHERE status <> ? ORDER BY last_observed_at DESC, rowid DESC", (IncidentStatus.RESOLVED.value,)).fetchall()
         return [_incident(row) for row in rows]
 
     def change_status(self, incident_id: str, status: IncidentStatus, *, reason: str | None = None) -> ThreatIncident:
-        """Change incident status and record the transition in the timeline."""
         status, now = IncidentStatus(status), _utc_now()
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -144,7 +135,6 @@ class IncidentService:
         return _incident(row)
 
     def record_high_confidence_detection(self, detection: DetectionResult, source: ScanSource) -> ThreatIncident:
-        """Create or update the active incident for a high-confidence SHA-256."""
         if detection.status is not DetectionStatus.HIGH_CONFIDENCE: raise ValueError("Only HIGH_CONFIDENCE detections create or update incidents.")
         sha256, path, source, reason = _sha256(detection.sha256), str(normalize_path(detection.path)), ScanSource(source), detection.reason
         if not reason: raise ValueError("High-confidence detection reason must not be empty.")
@@ -168,7 +158,6 @@ class IncidentService:
         return _incident(current)
 
     def record_reappearance(self, incident_id: str, detection: DetectionResult, source: ScanSource, *, explanation: str) -> tuple[ThreatIncident, IncidentEvent]:
-        """Reuse a previously handled incident and record one reappearance."""
         if detection.status is not DetectionStatus.HIGH_CONFIDENCE: raise ValueError("Only HIGH_CONFIDENCE detections can be reappearances.")
         if not explanation: raise ValueError("explanation must not be empty.")
         source, path, sha256, now = ScanSource(source), str(normalize_path(detection.path)), _sha256(detection.sha256), _utc_now()
@@ -205,7 +194,7 @@ class IncidentService:
     @classmethod
     def _upsert_file(cls, connection: sqlite3.Connection, incident_id: str, path: str, source: ScanSource, reason: str, occurred_at: str) -> None:
         row = connection.execute("SELECT id FROM incident_files WHERE incident_id = ? AND path = ?", (incident_id, path)).fetchone()
-        if row is None: cls._insert_file(connection, incident_id, path, source, reason, occurred_at); return
+        if row is None: return cls._insert_file(connection, incident_id, path, source, reason, occurred_at)
         connection.execute("UPDATE incident_files SET last_seen = ?, seen_count = seen_count + 1, last_source = ?, last_detection_reason = ? WHERE id = ?", (occurred_at, source.value, reason, row["id"]))
 
     @classmethod
