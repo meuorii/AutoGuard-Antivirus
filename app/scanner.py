@@ -1,4 +1,6 @@
-import errno, os, stat
+import errno
+import os
+import stat
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, Literal
@@ -9,39 +11,43 @@ from app.detector import SCRIPT_PREVIEW_BYTES, Detector
 from app.hashing import FileTooLargeError, UnsupportedFileError, inspect_file, is_link_or_reparse, normalize_path
 from app.incidents import IncidentService
 from app.models import DetectionStatus, EntryKind, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType
+from app.quarantine import QuarantineService
 from app.scan_history import ScanHistory, ScanHistoryError
 from app.threat_trail import ThreatTrail
 
 ScanMode = Literal["auto", "file", "directory"]
 
+
 class Scanner:
-    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None) -> None:
+    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None, quarantine: QuarantineService | None = None) -> None:
         if type(max_file_size_bytes) is not int or max_file_size_bytes < 0: raise ValueError("max_file_size_bytes must be a nonnegative integer.")
         self.detector, self.threat_trail, self.max_file_size_bytes = detector, threat_trail, max_file_size_bytes
         self.history = history if history is not None else ScanHistory(threat_trail.database)
         self.incidents = incidents if incidents is not None else IncidentService(threat_trail.database)
-        self._database_files = {normalize_path(str(database.path) + suffix) for database in (threat_trail.database, self.history.database) for suffix in ("", "-wal", "-shm", "-journal")}
+        self.quarantine, self._quarantine_dir = quarantine, normalize_path(quarantine.quarantine_dir) if quarantine is not None else None
+        self._database_files = {normalize_path(str(db.path) + sfx) for db in (threat_trail.database, self.history.database) for sfx in ("", "-wal", "-shm", "-journal")}
 
-    def scan_file(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanResult: return self._run(path, source, scan_type, "file").results[0]
-    def scan(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "auto")
-    def scan_directory(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "directory")
+    def scan_file(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanResult:
+        return self._run(path, source, scan_type, "file").results[0]
+
+    def scan(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary:
+        return self._run(path, source, scan_type, "auto")
+
+    def scan_directory(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary:
+        return self._run(path, source, scan_type, "directory")
 
     def _run(self, path: str | Path, source: ScanSource | None, scan_type: ScanType | None, mode: ScanMode) -> ScanSummary:
         if scan_type is None: source, scan_type = ScanSource.MANUAL if source is None else ScanSource(source), ScanType.from_source(ScanSource.MANUAL if source is None else ScanSource(source))
-        else: scan_type, source = ScanType(scan_type), ScanType(scan_type).default_source if source is None else ScanSource(source)
+        else: scan_type, source = ScanType(scan_type), scan_type.default_source if source is None else ScanSource(source)
         root = normalize_path(path)
         try: session = self.history.start_session(scan_type, root, source)
         except Exception as error: raise ScanHistoryError(f"Could not start scan history: {type(error).__name__}: {error}") from error
         results, stage = [], "processing"
         try:
             for result in self._iter_scan(root, source, mode):
-                result = replace(result, session_id=session.id)
-                stage = f"saving result for {result.path}"
-                self.history.record_result(session.id, result)
-                results.append(result)
-                stage = "processing"
-            stage = "finalizing history"
-            self.history.finish_session(session.id)
+                result = replace(result, session_id=session.id); stage = f"saving result for {result.path}"
+                self.history.record_result(session.id, result); results.append(result); stage = "processing"
+            stage = "finalizing history"; self.history.finish_session(session.id)
         except BaseException as error:
             detail = f"{stage}: {type(error).__name__}: {error}"
             try: self.history.finish_session(session.id, error=detail, interrupted=isinstance(error, (KeyboardInterrupt, SystemExit)))
@@ -82,16 +88,19 @@ class Scanner:
         kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
         if is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode): return ScanResult(str(path), ScanStatus.SKIPPED_UNSUPPORTED, "Only regular files are supported; links, reparse points, and special entries are skipped.", kind)
         if path in self._database_files: return ScanResult(str(path), ScanStatus.SKIPPED_UNSUPPORTED, "AutoGuard's active database files are excluded.")
+        if self._quarantine_dir is not None and (path == self._quarantine_dir or self._quarantine_dir in path.parents): return ScanResult(str(path), ScanStatus.SKIPPED_UNSUPPORTED, "AutoGuard quarantine storage is excluded from scanning.")
         if info.st_size > self.max_file_size_bytes: return ScanResult(str(path), ScanStatus.SKIPPED_SIZE, f"Size {info.st_size} exceeds limit {self.max_file_size_bytes} bytes.")
         detection, sha256, stage = None, None, "read"
         try:
             preview_bytes = SCRIPT_PREVIEW_BYTES if path.suffix.lower() in SCRIPT_EXTENSIONS else 0
             inspection = inspect_file(path, preview_bytes=preview_bytes, max_size_bytes=self.max_file_size_bytes, follow_symlinks=False)
             sha256, stage = inspection.fingerprint.sha256, "detection"
-            detection = self.detector.detect_inspection(inspection)
-            stage = "recording"
+            detection, stage = self.detector.detect_inspection(inspection), "recording"
             observation = self.threat_trail.record_fingerprint(inspection.fingerprint, source)
-            if detection.status is DetectionStatus.HIGH_CONFIDENCE: stage = "recording incident"; self.incidents.record_high_confidence_detection(detection, source)
+            if detection.status is DetectionStatus.HIGH_CONFIDENCE:
+                stage = "recording incident"; incident = self.incidents.record_high_confidence_detection(detection, source)
+                if self.quarantine is not None and detection.matched_signature is not None:
+                    stage = "quarantine"; self.quarantine.quarantine_detection(detection, incident.id, source, original_size=inspection.fingerprint.size_bytes)
         except Exception as error:
             if stage == "read": return self._failure(path, error, "file")
             return ScanResult(str(path), ScanStatus.ERROR, f"{stage.capitalize()} failed: {type(error).__name__}: {error}", detection=detection, sha256=sha256)
