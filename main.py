@@ -1,26 +1,22 @@
 from __future__ import annotations
-
 import argparse, json, threading, time
 from pathlib import Path
-
 from app.config import AppConfig
 from app.scheduler import ScheduleSettings
 from app.startup import AutoGuardServices, AutoGuardStartup, StartupSettings
 
-
 def print_scan(summary, services: AutoGuardServices) -> None:
     print(f"Scan ID: {summary.session_id}")
     for result in summary.results: print(f"[{result.status.value}] {result.path}: {result.reason}")
-    print(json.dumps(summary.counts, indent=2))
-    print(summary.message)
+    print(json.dumps(summary.counts, indent=2)); print(summary.message)
+    if summary.session_id is not None:
+        print(); print(services.reports.build_scan_report(summary.session_id).to_text(), end="")
     for reappearance_result in services.scanner.last_reappearance_results:
         print(f"Reappearance: incident={reappearance_result.incident.id if reappearance_result.incident else 'unknown'}, count={reappearance_result.reappearance_count}, {reappearance_result.explanation or ''}")
 
-
 def minimal_interface(services: AutoGuardServices, initial_path: Path | None = None) -> None:
     """Temporary Phase 12 interface shell; replace with the real UI later."""
-    print("AutoGuard Phase 12 is running.")
-    print(f"Database: {services.config.database_path}\nQuarantine: {services.config.quarantine_dir}\nSignatures loaded: {len(services.signatures)}")
+    print("AutoGuard Phase 14 is running."); print(f"Database: {services.config.database_path}"); print(f"Quarantine: {services.config.quarantine_dir}"); print(f"Signatures loaded: {len(services.signatures)}")
     if services.startup_dispatch is not None: print(f"Startup quick scan: {services.startup_dispatch.status.value}")
     print(f"Scheduled scans: quick every {services.scheduler.settings.quick_interval_hours:g}h, full every {services.scheduler.settings.full_interval_days:g}d")
 
@@ -33,10 +29,9 @@ def minimal_interface(services: AutoGuardServices, initial_path: Path | None = N
     print("Minimal interface active. Press Ctrl+C to shut down AutoGuard.")
     while True: time.sleep(1.0)
 
-
 def main() -> None:
     config = AppConfig()
-    parser = argparse.ArgumentParser(description="AutoGuard Phase 12 automatic startup and scheduled scanning")
+    parser = argparse.ArgumentParser(description="AutoGuard Phase 14 automatic protection and evidence-based reporting")
     parser.add_argument("path", nargs="?", type=Path, help="Optional one-shot file/directory scan")
     parser.add_argument("--max-bytes", type=int, default=config.max_file_size_bytes)
     parser.add_argument("--quick-hours", type=float, default=24.0)
@@ -75,7 +70,6 @@ def main() -> None:
         if report.errors:
             for error in report.errors: print(f"Shutdown warning: {error}")
         print("AutoGuard stopped.")
-
 
 if __name__ == "__main__":
     main()
