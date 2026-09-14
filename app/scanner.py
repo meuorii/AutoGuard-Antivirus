@@ -12,46 +12,43 @@ from app.incidents import IncidentService
 from app.matching_cleanup import MatchingCleanupResult, MatchingCopyCleanup
 from app.models import DetectionStatus, EntryKind, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType
 from app.quarantine import QuarantineService
+from app.reappearance import ReappearanceResult, ReappearanceWatch
 from app.scan_history import ScanHistory, ScanHistoryError
 from app.threat_trail import ThreatTrail
 
 ScanMode = Literal["auto", "file", "directory"]
 
-
 class Scanner:
-    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None, quarantine: QuarantineService | None = None, matching_cleanup: MatchingCopyCleanup | None = None, cleanup_verifier: CleanupVerifier | None = None) -> None:
+    def __init__(self, detector: Detector, threat_trail: ThreatTrail, *, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES, history: ScanHistory | None = None, incidents: IncidentService | None = None, quarantine: QuarantineService | None = None, matching_cleanup: MatchingCopyCleanup | None = None, cleanup_verifier: CleanupVerifier | None = None, reappearance: ReappearanceWatch | None = None) -> None:
         if type(max_file_size_bytes) is not int or max_file_size_bytes < 0: raise ValueError("max_file_size_bytes must be a nonnegative integer.")
         self.detector, self.threat_trail, self.max_file_size_bytes = detector, threat_trail, max_file_size_bytes
         self.history = history if history is not None else ScanHistory(threat_trail.database)
         self.incidents = incidents if incidents is not None else IncidentService(threat_trail.database)
         self.quarantine, self.matching_cleanup, self.cleanup_verifier = quarantine, matching_cleanup, cleanup_verifier
+        self.reappearance = reappearance if reappearance is not None else ReappearanceWatch(threat_trail.database, self.incidents)
+        self.last_reappearance_results: tuple[ReappearanceResult, ...] = ()
         self.last_matching_cleanup_results: tuple[MatchingCleanupResult, ...] = ()
         self.last_cleanup_verification_results: tuple[CleanupVerificationResult, ...] = ()
+        self._current_reappearance_results: list[ReappearanceResult] = []
         self._quarantine_dir = normalize_path(quarantine.quarantine_dir) if quarantine is not None else None
-        self._database_files = {normalize_path(str(database.path) + suffix) for database in (threat_trail.database, self.history.database) for suffix in ("", "-wal", "-shm", "-journal")}
+        self._database_files = {normalize_path(str(db.path) + sfx) for db in (threat_trail.database, self.history.database) for sfx in ("", "-wal", "-shm", "-journal")}
 
     def scan_file(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanResult: return self._run(path, source, scan_type, "file").results[0]
-
     def scan(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "auto")
-
     def scan_directory(self, path: str | Path, source: ScanSource | None = None, *, scan_type: ScanType | None = None) -> ScanSummary: return self._run(path, source, scan_type, "directory")
 
     def _run(self, path: str | Path, source: ScanSource | None, scan_type: ScanType | None, mode: ScanMode) -> ScanSummary:
-        if scan_type is None: source, scan_type = ScanSource.MANUAL if source is None else ScanSource(source), ScanType.from_source(source if source is not None else ScanSource.MANUAL)
-        else: scan_type, source = ScanType(scan_type), scan_type.default_source if source is None else ScanSource(source)
-        root = normalize_path(path)
+        if scan_type is None: source, scan_type = (ScanSource.MANUAL if source is None else ScanSource(source)), ScanType.from_source(ScanSource.MANUAL if source is None else ScanSource(source))
+        else: scan_type, source = ScanType(scan_type), (scan_type.default_source if source is None else ScanSource(source))
+        root, self._current_reappearance_results = normalize_path(path), []
         try: session = self.history.start_session(scan_type, root, source)
         except Exception as error: raise ScanHistoryError(f"Could not start scan history: {type(error).__name__}: {error}") from error
         results, stage = [], "processing"
         try:
             for result in self._iter_scan(root, source, mode):
-                result = replace(result, session_id=session.id)
-                stage = f"saving result for {result.path}"
-                self.history.record_result(session.id, result)
-                results.append(result)
-                stage = "processing"
-            stage = "finalizing history"
-            self.history.finish_session(session.id)
+                result = replace(result, session_id=session.id); stage = f"saving result for {result.path}"
+                self.history.record_result(session.id, result); results.append(result); stage = "processing"
+            stage = "finalizing history"; self.history.finish_session(session.id)
         except BaseException as error:
             detail = f"{stage}: {type(error).__name__}: {error}"
             try: self.history.finish_session(session.id, error=detail, interrupted=isinstance(error, (KeyboardInterrupt, SystemExit)))
@@ -60,8 +57,9 @@ class Scanner:
                 raise ScanHistoryError(f"{detail}; could not finalize history: {finish_error}", session.id) from finish_error
             if stage != "processing" and isinstance(error, Exception): raise ScanHistoryError(detail, session.id) from error
             raise
+        self.last_reappearance_results = tuple(self._current_reappearance_results)
         cleanup_results, verification_results = [], []
-        dangerous_hashes = {result.detection.sha256 for result in results if result.detection is not None and result.detection.status is DetectionStatus.HIGH_CONFIDENCE}
+        dangerous_hashes = {r.detection.sha256 for r in results if r.detection is not None and r.detection.status is DetectionStatus.HIGH_CONFIDENCE}
         active_by_hash = {item.sha256: item.id for item in self.incidents.get_active_incidents()}
         incident_ids = [active_by_hash[sha256] for sha256 in dangerous_hashes if sha256 in active_by_hash]
         if self.matching_cleanup is not None:
@@ -81,8 +79,7 @@ class Scanner:
         else: yield self._process_file(root, info, source)
 
     def _iter_directory(self, root: Path, source: ScanSource) -> Iterator[ScanResult]:
-        pending: list[tuple[Path, EntryKind]] = [(root, "directory")]
-        visited: set[tuple[int, int]] = set()
+        pending, visited = [(root, "directory")], set()
         while pending:
             current, kind = pending.pop()
             try: info = current.lstat()
@@ -109,21 +106,23 @@ class Scanner:
         try:
             preview_bytes = SCRIPT_PREVIEW_BYTES if path.suffix.lower() in SCRIPT_EXTENSIONS else 0
             inspection = inspect_file(path, preview_bytes=preview_bytes, max_size_bytes=self.max_file_size_bytes, follow_symlinks=False)
-            sha256 = inspection.fingerprint.sha256
-            stage = "detection"
-            detection = self.detector.detect_inspection(inspection)
-            stage = "recording"
+            sha256, stage = inspection.fingerprint.sha256, "detection"
+            detection, stage = self.detector.detect_inspection(inspection), "recording"
             observation = self.threat_trail.record_fingerprint(inspection.fingerprint, source)
+            result_reason = detection.reason
             if detection.status is DetectionStatus.HIGH_CONFIDENCE:
-                stage = "recording incident"
-                incident = self.incidents.record_high_confidence_detection(detection, source)
+                stage = "checking reappearance"; reappearance = self.reappearance.check_detection(detection, source)
+                if reappearance.detected:
+                    if reappearance.incident is None: raise RuntimeError("Reappearance was detected without an incident.")
+                    incident = reappearance.incident; self._current_reappearance_results.append(reappearance)
+                    if reappearance.explanation: result_reason = f"{detection.reason} {reappearance.explanation}"
+                else: stage = "recording incident"; incident = self.incidents.record_high_confidence_detection(detection, source)
                 if self.quarantine is not None and detection.matched_signature is not None:
-                    stage = "quarantine"
-                    self.quarantine.quarantine_detection(detection, incident.id, source, original_size=inspection.fingerprint.size_bytes)
+                    stage = "quarantine"; self.quarantine.quarantine_detection(detection, incident.id, source, original_size=inspection.fingerprint.size_bytes)
         except Exception as error:
             if stage == "read": return self._failure(path, error, "file")
             return ScanResult(str(path), ScanStatus.ERROR, f"{stage.capitalize()} failed: {type(error).__name__}: {error}", detection=detection, sha256=sha256)
-        return ScanResult(str(path), ScanStatus.SCANNED, detection.reason, detection=detection, observation=observation, sha256=sha256)
+        return ScanResult(str(path), ScanStatus.SCANNED, result_reason, detection=detection, observation=observation, sha256=sha256)
 
     @staticmethod
     def _failure(path: Path, error: Exception, kind: EntryKind) -> ScanResult:
