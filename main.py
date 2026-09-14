@@ -1,38 +1,14 @@
 from __future__ import annotations
-import argparse, json, threading, time
+import argparse
 from pathlib import Path
 from app.config import AppConfig
 from app.scheduler import ScheduleSettings
-from app.startup import AutoGuardServices, AutoGuardStartup, StartupSettings
-
-def print_scan(summary, services: AutoGuardServices) -> None:
-    print(f"Scan ID: {summary.session_id}")
-    for result in summary.results: print(f"[{result.status.value}] {result.path}: {result.reason}")
-    print(json.dumps(summary.counts, indent=2)); print(summary.message)
-    if summary.session_id is not None:
-        print(); print(services.reports.build_scan_report(summary.session_id).to_text(), end="")
-    for reappearance_result in services.scanner.last_reappearance_results:
-        print(f"Reappearance: incident={reappearance_result.incident.id if reappearance_result.incident else 'unknown'}, count={reappearance_result.reappearance_count}, {reappearance_result.explanation or ''}")
-
-def minimal_interface(services: AutoGuardServices, initial_path: Path | None = None) -> None:
-    """Temporary Phase 12 interface shell; replace with the real UI later."""
-    print("AutoGuard Phase 14 is running."); print(f"Database: {services.config.database_path}"); print(f"Quarantine: {services.config.quarantine_dir}"); print(f"Signatures loaded: {len(services.signatures)}")
-    if services.startup_dispatch is not None: print(f"Startup quick scan: {services.startup_dispatch.status.value}")
-    print(f"Scheduled scans: quick every {services.scheduler.settings.quick_interval_hours:g}h, full every {services.scheduler.settings.full_interval_days:g}d")
-
-    if initial_path is not None:
-        def one_shot() -> None:
-            try: print_scan(services.scanner.scan(initial_path), services)
-            except Exception as error: print(f"One-shot scan failed: {type(error).__name__}: {error}")
-        threading.Thread(target=one_shot, name="AutoGuardManualScan", daemon=True).start()
-
-    print("Minimal interface active. Press Ctrl+C to shut down AutoGuard.")
-    while True: time.sleep(1.0)
+from app.startup import AutoGuardStartup, StartupSettings
 
 def main() -> None:
     config = AppConfig()
-    parser = argparse.ArgumentParser(description="AutoGuard Phase 14 automatic protection and evidence-based reporting")
-    parser.add_argument("path", nargs="?", type=Path, help="Optional one-shot file/directory scan")
+    parser = argparse.ArgumentParser(description="AutoGuard Phase 15 automatic protection")
+    parser.add_argument("path", nargs="?", type=Path, help="Optional file/directory to scan after the UI opens")
     parser.add_argument("--max-bytes", type=int, default=config.max_file_size_bytes)
     parser.add_argument("--quick-hours", type=float, default=24.0)
     parser.add_argument("--full-days", type=float, default=7.0)
@@ -50,26 +26,21 @@ def main() -> None:
     if args.debounce_seconds < 0 or args.stability_seconds < 0: parser.error("monitor timing values must not be negative")
     if args.usb_poll_seconds <= 0: parser.error("--usb-poll-seconds must be greater than zero")
 
-    config = AppConfig(max_file_size_bytes=args.max_bytes)
     settings = StartupSettings(
-        schedule=ScheduleSettings(quick_interval_hours=args.quick_hours, full_interval_days=args.full_days),
-        startup_quick_scan_enabled=not args.no_startup_scan,
-        scheduler_enabled=not args.no_scheduler,
-        file_monitor_enabled=not args.no_file_monitor,
-        usb_monitor_enabled=False if args.no_usb_monitor else None,
-        debounce_seconds=args.debounce_seconds,
-        stability_seconds=args.stability_seconds,
-        usb_poll_seconds=args.usb_poll_seconds,
+        schedule=ScheduleSettings(args.quick_hours, args.full_days), startup_quick_scan_enabled=not args.no_startup_scan,
+        scheduler_enabled=not args.no_scheduler, file_monitor_enabled=not args.no_file_monitor,
+        usb_monitor_enabled=False if args.no_usb_monitor else None, debounce_seconds=args.debounce_seconds,
+        stability_seconds=args.stability_seconds, usb_poll_seconds=args.usb_poll_seconds,
     )
-    application = AutoGuardStartup(config, settings)
+    application = AutoGuardStartup(AppConfig(max_file_size_bytes=args.max_bytes), settings)
 
-    try: application.start(lambda services: minimal_interface(services, args.path))
-    except KeyboardInterrupt: print("Stopping AutoGuard...")
-    finally:
-        report = application.shutdown()
-        if report.errors:
-            for error in report.errors: print(f"Shutdown warning: {error}")
-        print("AutoGuard stopped.")
+    try:
+        try: from app.ui.main_window import launch_desktop
+        except ModuleNotFoundError as error:
+            if error.name == "customtkinter":
+                raise SystemExit("customtkinter is required for the Phase 15 desktop UI. Install dependencies with: .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt") from error
+            raise
+        application.start(lambda services: launch_desktop(services, args.path))
+    finally: application.shutdown()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

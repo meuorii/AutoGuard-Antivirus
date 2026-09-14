@@ -1,30 +1,45 @@
-import os, shutil, sqlite3; from dataclasses import dataclass; from datetime import datetime, timezone; from enum import Enum; from pathlib import Path; from uuid import uuid4
-from app.database import Database; from app.hashing import normalize_path; from app.incidents import IncidentEventType, IncidentService, IncidentStatus; from app.models import DetectionResult, DetectionStatus, ScanSource; from app.quarantine_integrity import IntegrityResult, verify_quarantine_file
+from __future__ import annotations
+import os, shutil, sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from uuid import uuid4
+from app.database import Database
+from app.hashing import normalize_path
+from app.incidents import IncidentEventType, IncidentService, IncidentStatus
+from app.models import DetectionResult, DetectionStatus, ScanSource
+from app.quarantine_integrity import IntegrityResult, verify_quarantine_file
 
 class QuarantineState(str, Enum): PENDING = "PENDING"; QUARANTINED = "QUARANTINED"; FAILED = "FAILED"
 class QuarantineIntegrityStatus(str, Enum): PENDING = "PENDING"; VERIFIED = "VERIFIED"; FAILED = "FAILED"
 
 @dataclass(frozen=True)
 class QuarantineItem:
-    quarantine_id: str; incident_id: str; original_path: str; stored_path: str; sha256: str; original_size: int | None; created_at: datetime; quarantined_at: datetime | None; reason: str; original_source: ScanSource; state: QuarantineState; integrity_status: QuarantineIntegrityStatus; verified_sha256: str | None; verified_size: int | None; verified_at: datetime | None; original_removed: bool; failure_reason: str | None
+    quarantine_id: str; incident_id: str; original_path: str; stored_path: str; sha256: str
+    original_size: int | None; created_at: datetime; quarantined_at: datetime | None; reason: str
+    original_source: ScanSource; state: QuarantineState; integrity_status: QuarantineIntegrityStatus
+    verified_sha256: str | None; verified_size: int | None; verified_at: datetime | None
+    original_removed: bool; failure_reason: str | None
 
 class QuarantineService:
     """Move verified threat content into non-executable internal storage."""
     def __init__(self, database: Database, quarantine_dir: str | Path, incidents: IncidentService | None = None) -> None:
-        self.database = database; self.quarantine_dir = normalize_path(quarantine_dir); self.quarantine_dir.mkdir(parents=True, exist_ok=True); self.incidents = incidents if incidents is not None else IncidentService(database)
+        self.database = database; self.quarantine_dir = normalize_path(quarantine_dir)
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        self.incidents = incidents if incidents is not None else IncidentService(database)
 
     def quarantine_detection(self, detection: DetectionResult, incident_id: str, source: ScanSource, *, original_size: int | None = None) -> QuarantineItem:
-        """Quarantine only signature-backed HIGH_CONFIDENCE detections."""
         if detection.status is not DetectionStatus.HIGH_CONFIDENCE: raise ValueError("Automatic quarantine requires a HIGH_CONFIDENCE detection.")
         if detection.matched_signature is None: raise ValueError("Automatic quarantine requires known-signature evidence.")
         return self.quarantine_file(incident_id=incident_id, path=detection.path, expected_sha256=detection.sha256, reason=detection.reason, source=source, expected_size=original_size)
 
     def quarantine_file(self, incident_id: str, path: str | Path, expected_sha256: str, reason: str, source: ScanSource, *, expected_size: int | None = None) -> QuarantineItem:
-        """Quarantine one file and persist all success/failure evidence."""
         original_path = normalize_path(path); original_path_text = str(original_path); expected_sha256 = _sha256(expected_sha256); source = ScanSource(source)
         if not reason: raise ValueError("reason must not be empty.")
         if expected_size is not None and (type(expected_size) is not int or expected_size < 0): raise ValueError("expected_size must be a nonnegative integer or None.")
-        if (existing := self._existing_success(incident_id, original_path_text, expected_sha256)) is not None: return existing
+        existing = self._existing_success(incident_id, original_path_text, expected_sha256)
+        if existing is not None: return existing
         self._validate_incident(incident_id, expected_sha256)
         if expected_size is None:
             try: expected_size = original_path.stat().st_size
@@ -37,23 +52,29 @@ class QuarantineService:
         try:
             shutil.copyfile(original_path, temp_path); _restrict_permissions(temp_path)
             copied_integrity = verify_quarantine_file(temp_path, expected_sha256, expected_size)
-            if not copied_integrity.verified: _safe_unlink(temp_path); return self._fail(quarantine_id, incident_id, original_path, source, copied_integrity.error or "Copied quarantine content failed verification.", integrity=copied_integrity)
+            if not copied_integrity.verified:
+                _safe_unlink(temp_path)
+                return self._fail(quarantine_id, incident_id, original_path, source, copied_integrity.error or "Copied quarantine content failed verification.", integrity=copied_integrity)
             os.replace(temp_path, stored_path); _restrict_permissions(stored_path)
             final_integrity = verify_quarantine_file(stored_path, expected_sha256, expected_size)
-            if not final_integrity.verified: _safe_unlink(stored_path); return self._fail(quarantine_id, incident_id, original_path, source, final_integrity.error or "Final quarantine content failed verification.", integrity=final_integrity)
+            if not final_integrity.verified:
+                _safe_unlink(stored_path)
+                return self._fail(quarantine_id, incident_id, original_path, source, final_integrity.error or "Final quarantine content failed verification.", integrity=final_integrity)
             if original_path.exists():
                 source_integrity = verify_quarantine_file(original_path, expected_sha256, expected_size)
-                if not source_integrity.verified: return self._fail(quarantine_id, incident_id, original_path, source, "Original file changed after detection; it was left in place. " + (source_integrity.error or ""), integrity=final_integrity)
+                if not source_integrity.verified:
+                    return self._fail(quarantine_id, incident_id, original_path, source, "Original file changed after detection; it was left in place. " + (source_integrity.error or ""), integrity=final_integrity)
                 try: original_path.unlink()
-                except OSError as error: return self._fail(quarantine_id, incident_id, original_path, source, f"Verified quarantine copy exists, but original could not be removed: {type(error).__name__}: {error}", integrity=final_integrity)
+                except OSError as error:
+                    return self._fail(quarantine_id, incident_id, original_path, source, f"Verified quarantine copy exists, but original could not be removed: {type(error).__name__}: {error}", integrity=final_integrity)
             quarantined_at = _utc_now(); self._mark_success(quarantine_id, final_integrity, quarantined_at)
             self.incidents.append_event(incident_id, IncidentEventType.QUARANTINE_SUCCEEDED, path=original_path, source=source, detection_reason=f"Quarantine {quarantine_id} verified and original location removed.")
             return self.get_item(quarantine_id)  # type: ignore[return-value]
         except Exception as error:
-            _safe_unlink(temp_path); return self._fail(quarantine_id, incident_id, original_path, source, f"Quarantine operation failed: {type(error).__name__}: {error}", integrity=final_integrity or copied_integrity)
+            _safe_unlink(temp_path)
+            return self._fail(quarantine_id, incident_id, original_path, source, f"Quarantine operation failed: {type(error).__name__}: {error}", integrity=final_integrity or copied_integrity)
 
     def list_quarantined_items(self) -> list[QuarantineItem]:
-        """Return all quarantine attempts, including durable failure records."""
         with self.database.connection() as connection: rows = connection.execute("SELECT * FROM quarantine_items ORDER BY created_at DESC, rowid DESC").fetchall()
         return [_item(row) for row in rows]
 
@@ -61,13 +82,11 @@ class QuarantineService:
         with self.database.connection() as connection: row = connection.execute("SELECT * FROM quarantine_items WHERE quarantine_id = ?", (quarantine_id,)).fetchone()
         return _item(row) if row is not None else None
 
-    def get_metadata(self, quarantine_id: str) -> QuarantineItem | None:
-        """Alias for callers that treat QuarantineItem as persisted metadata."""
-        return self.get_item(quarantine_id)
+    def get_metadata(self, quarantine_id: str) -> QuarantineItem | None: return self.get_item(quarantine_id)
 
     def verify_integrity(self, quarantine_id: str) -> IntegrityResult:
-        """Recheck stored content and persist the newest integrity evidence."""
-        if (item := self.get_item(quarantine_id)) is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
+        item = self.get_item(quarantine_id)
+        if item is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
         result = verify_quarantine_file(item.stored_path, item.sha256, item.original_size)
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -80,8 +99,19 @@ class QuarantineService:
         return result
 
     def original_location_exists(self, quarantine_id: str) -> bool:
-        if (item := self.get_item(quarantine_id)) is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
+        item = self.get_item(quarantine_id)
+        if item is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
         return Path(item.original_path).exists()
+
+    def delete_quarantine_object(self, quarantine_id: str) -> bool:
+        item = self.get_item(quarantine_id)
+        if item is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
+        try: Path(item.stored_path).unlink(missing_ok=True)
+        except OSError as error: raise OSError(f"Could not delete quarantine object {quarantine_id}: {error}") from error
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""UPDATE quarantine_items SET state = 'FAILED', integrity_status = 'FAILED', failure_reason = ? WHERE quarantine_id = ?""", ("Quarantine object permanently deleted by user.", quarantine_id))
+        return True
 
     def _existing_success(self, incident_id: str, original_path: str, sha256: str) -> QuarantineItem | None:
         with self.database.connection() as connection: row = connection.execute("""SELECT * FROM quarantine_items WHERE incident_id = ? AND original_path = ? AND sha256 = ? AND state = 'QUARANTINED' ORDER BY quarantined_at DESC, rowid DESC LIMIT 1""", (incident_id, original_path, sha256)).fetchone()
@@ -89,7 +119,8 @@ class QuarantineService:
         return _item(row)
 
     def _validate_incident(self, incident_id: str, sha256: str) -> None:
-        if (details := self.incidents.get_incident(incident_id)) is None: raise KeyError(f"Unknown threat incident: {incident_id}")
+        details = self.incidents.get_incident(incident_id)
+        if details is None: raise KeyError(f"Unknown threat incident: {incident_id}")
         if details.incident.status is IncidentStatus.RESOLVED: raise ValueError("Cannot quarantine content for a RESOLVED incident.")
         if details.incident.sha256 != sha256: raise ValueError("Quarantine SHA-256 does not match the incident SHA-256.")
 
@@ -109,15 +140,17 @@ class QuarantineService:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("""UPDATE quarantine_items SET state = 'FAILED', integrity_status = ?, verified_sha256 = ?, verified_size = ?, verified_at = ?, original_removed = 0, failure_reason = ? WHERE quarantine_id = ?""", (integrity_status.value, integrity.actual_sha256 if integrity else None, integrity.actual_size if integrity else None, integrity.checked_at.isoformat(timespec="microseconds") if integrity else _utc_now(), failure_reason, quarantine_id))
         self.incidents.append_event(incident_id, IncidentEventType.QUARANTINE_FAILED, path=original_path, source=source, detection_reason=f"Quarantine {quarantine_id} failed: {failure_reason}")
-        if (item := self.get_item(quarantine_id)) is None: raise RuntimeError("Quarantine failure state was not persisted.")
+        item = self.get_item(quarantine_id)
+        if item is None: raise RuntimeError("Quarantine failure state was not persisted.")
         return item
 
     def _known_incident_location_still_exists(self, incident_id: str) -> bool:
-        if (details := self.incidents.get_incident(incident_id)) is None: return False
+        details = self.incidents.get_incident(incident_id)
+        if details is None: return False
         return any(Path(item.path).exists() for item in details.files)
 
 def _item(row: sqlite3.Row) -> QuarantineItem:
-    return QuarantineItem(quarantine_id=row["quarantine_id"], incident_id=row["incident_id"], original_path=row["original_path"], stored_path=row["stored_path"], sha256=row["sha256"], original_size=row["original_size"], created_at=datetime.fromisoformat(row["created_at"]), quarantined_at=(datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None), reason=row["reason"], original_source=ScanSource(row["original_source"]), state=QuarantineState(row["state"]), integrity_status=QuarantineIntegrityStatus(row["integrity_status"]), verified_sha256=row["verified_sha256"], verified_size=row["verified_size"], verified_at=(datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None), original_removed=bool(row["original_removed"]), failure_reason=row["failure_reason"])
+    return QuarantineItem(quarantine_id=row["quarantine_id"], incident_id=row["incident_id"], original_path=row["original_path"], stored_path=row["stored_path"], sha256=row["sha256"], original_size=row["original_size"], created_at=datetime.fromisoformat(row["created_at"]), quarantined_at=datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None, reason=row["reason"], original_source=ScanSource(row["original_source"]), state=QuarantineState(row["state"]), integrity_status=QuarantineIntegrityStatus(row["integrity_status"]), verified_sha256=row["verified_sha256"], verified_size=row["verified_size"], verified_at=datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None, original_removed=bool(row["original_removed"]), failure_reason=row["failure_reason"])
 
 def _sha256(value: str) -> str:
     normalized = value.strip().lower()
@@ -125,6 +158,7 @@ def _sha256(value: str) -> str:
     return normalized
 
 def _utc_now() -> str: return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
 def _safe_unlink(path: Path) -> None:
     try: path.unlink(missing_ok=True)
     except OSError: pass

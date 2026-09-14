@@ -1,0 +1,73 @@
+from __future__ import annotations
+import threading, time
+from pathlib import Path
+from types import SimpleNamespace
+from app.models import ScanResult, ScanStatus, ScanSummary, ScanType
+from app.database import Database
+from app.detector import Detector
+from app.scanner import Scanner
+from app.signatures import SignatureStore
+from app.threat_trail import ThreatTrail
+from app.ui.controller import AutoGuardUIController
+from app.ui.messages import UIMessageBus
+
+def wait_for(bus: UIMessageBus, kind: str, timeout: float = 2.0):
+    deadline = time.monotonic() + timeout; seen = []
+    while time.monotonic() < deadline:
+        seen.extend(bus.drain())
+        for message in seen:
+            if message.kind == kind: return message, seen
+        time.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for {kind}; saw {[m.kind for m in seen]}")
+
+def test_message_bus_preserves_fifo_order():
+    bus = UIMessageBus(); bus.publish("first", value=1); bus.publish("second", value=2)
+    assert [message.kind for message in bus.drain()] == ["first", "second"]; assert bus.pending() == 0
+
+def test_message_bus_validates_kind_and_limit():
+    bus = UIMessageBus()
+    try: bus.publish("   ")
+    except ValueError: pass
+    else: raise AssertionError("empty message kind should be rejected")
+    try: bus.drain(0)
+    except ValueError: pass
+    else: raise AssertionError("nonpositive drain limit should be rejected")
+
+class FakeScanner:
+    def __init__(self): self.thread_id = None
+    def scan(self, path, source, *, scan_type, on_result=None):
+        self.thread_id = threading.get_ident()
+        result = ScanResult(str(path), ScanStatus.SCANNED, "No threat detected.")
+        if on_result: on_result(result)
+        time.sleep(0.04)
+        return ScanSummary((result,), "session-1")
+
+def fake_services(scanner):
+    scheduler = SimpleNamespace(quick_paths=(Path("quick"),), full_paths=(Path("full"),), settings=SimpleNamespace(quick_interval_hours=24.0, full_interval_days=7.0))
+    return SimpleNamespace(scanner=scanner, scheduler=scheduler)
+
+def test_controller_dispatches_manual_scan_off_calling_thread():
+    bus = UIMessageBus(); scanner = FakeScanner(); controller = AutoGuardUIController(fake_services(scanner), bus)
+    calling_thread = threading.get_ident(); started = time.monotonic()
+    controller.start_scan("example.txt", scan_type=ScanType.MANUAL)
+    elapsed = time.monotonic() - started; message, seen = wait_for(bus, "scan_completed")
+    try:
+        assert elapsed < 0.03; assert scanner.thread_id is not None and scanner.thread_id != calling_thread
+        assert any(item.kind == "scan_result" for item in seen); assert message.payload["result"].session_id == "session-1"
+    finally: controller.shutdown()
+
+def test_controller_emits_task_failure_without_raising_on_ui_thread():
+    class FailingScanner(FakeScanner):
+        def scan(self, *args, **kwargs): raise PermissionError("simulated locked target")
+    bus = UIMessageBus(); controller = AutoGuardUIController(fake_services(FailingScanner()), bus)
+    controller.start_scan("locked.bin"); failure, _ = wait_for(bus, "task_failed")
+    try:
+        assert "PermissionError" in failure.payload["error"]; assert "simulated locked target" in failure.payload["error"]
+    finally: controller.shutdown()
+
+def test_scan_progress_callback_failure_does_not_change_scanner_result(tmp_path):
+    database = Database(tmp_path / "autoguard.db"); database.initialize()
+    scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
+    target = tmp_path / "safe.txt"; target.write_text("harmless", encoding="utf-8")
+    result = scanner.scan_file(target, on_result=lambda _: (_ for _ in ()).throw(RuntimeError("UI gone")))
+    assert result.status is ScanStatus.SCANNED
