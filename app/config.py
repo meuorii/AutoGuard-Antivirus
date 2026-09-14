@@ -1,9 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-HASH_CHUNK_SIZE = 1024 * 1024
-DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024 * 1024
-SQLITE_TIMEOUT_SECONDS = 30.0
+HASH_CHUNK_SIZE = 1024 * 1024; DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024 * 1024; SQLITE_TIMEOUT_SECONDS = 30.0
 
 @dataclass(frozen=True)
 class AppConfig:

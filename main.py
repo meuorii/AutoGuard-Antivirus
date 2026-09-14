@@ -1,5 +1,6 @@
 import argparse, json, logging
 from pathlib import Path
+
 from app.config import AppConfig
 from app.database import Database
 from app.detector import Detector
