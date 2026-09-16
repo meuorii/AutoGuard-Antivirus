@@ -6,7 +6,6 @@ from app.ui.base_page import BasePage
 
 _STATE_STYLE = {"protected": (theme.SUCCESS, theme.SUCCESS_DARK, "✓"), "scanning": (theme.ACCENT, theme.ACCENT_DARK, "↻"), "attention": (theme.WARNING, theme.WARNING_DARK, "!"), "issue": (theme.DANGER, theme.DANGER_DARK, "!")}
 
-
 class _SummaryBlock(ctk.CTkFrame):
     def __init__(self, master, label: str):
         super().__init__(master, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
