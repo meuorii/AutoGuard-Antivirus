@@ -12,7 +12,6 @@ from app.threat_trail import ThreatTrail
 from app.ui.controller import AutoGuardUIController
 from app.ui.messages import UIMessageBus
 
-
 def wait_for(bus: UIMessageBus, kind: str, timeout: float = 2.0):
     deadline = time.monotonic() + timeout; seen = []
     while time.monotonic() < deadline:
@@ -21,7 +20,6 @@ def wait_for(bus: UIMessageBus, kind: str, timeout: float = 2.0):
             if message.kind == kind: return message, seen
         time.sleep(0.01)
     raise AssertionError(f"Timed out waiting for {kind}; saw {[m.kind for m in seen]}")
-
 
 def test_message_bus_preserves_fifo_order():
     bus = UIMessageBus(); bus.publish("first", value=1); bus.publish("second", value=2)
@@ -183,3 +181,26 @@ def test_ux_refresh_phase2_view_activity_request_uses_message_bus():
         controller.navigate_to("activity"); messages = bus.drain()
         assert len(messages) == 1 and messages[0].kind == "navigate" and messages[0].payload["page"] == "activity"
     finally: controller.shutdown()
+
+def test_ux_refresh_phase3_idle_scan_page_uses_simple_user_facing_choices():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8")
+    assert 'text="Scan your PC"' in source and 'title="Quick Scan"' in source and 'title="Full Scan"' in source and 'title="Custom Scan"' in source
+    assert 'recommended=True' in source and "Downloads  •  Desktop  •  Documents" in source
+    assert '"Start Quick Scan", self.controller.start_quick_scan' in source and '"Start Full Scan", self.controller.start_full_scan' in source
+    assert '"Choose File", self._choose_file' in source and '"Choose Folder", self._choose_folder' in source and "Manual Scan" not in source
+
+
+def test_ux_refresh_phase3_custom_scan_delegates_to_controller_without_scanner_logic():
+    import ast
+    source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8"); tree = ast.parse(source)
+    controller_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == "self" and node.value.attr == "controller"
+    ]
+    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= {node.attr for node in controller_calls}
+    for forbidden in ("hashlib", "sha256(", "Detector(", "inspect_file(", "ThreatTrail("): assert forbidden not in source
+
+
+def test_ux_refresh_phase3_manual_internal_label_is_presented_as_custom_scan():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/components/scan_progress.py").read_text(encoding="utf-8")
+    assert '"manual":"Custom Scan"' in source and '"manual":"Manual Scan"' not in source
