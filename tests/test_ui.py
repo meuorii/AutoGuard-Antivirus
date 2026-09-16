@@ -189,18 +189,20 @@ def test_ux_refresh_phase3_idle_scan_page_uses_simple_user_facing_choices():
     assert '"Start Quick Scan", self.controller.start_quick_scan' in source and '"Start Full Scan", self.controller.start_full_scan' in source
     assert '"Choose File", self._choose_file' in source and '"Choose Folder", self._choose_folder' in source and "Manual Scan" not in source
 
-
 def test_ux_refresh_phase3_custom_scan_delegates_to_controller_without_scanner_logic():
     import ast
     source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8"); tree = ast.parse(source)
     controller_calls = [
         node for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == "self" and node.value.attr == "controller"
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self" and node.value.attr == "controller"
     ]
-    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= {node.attr for node in controller_calls}
+    names = {node.attr for node in controller_calls}
+    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= names
     for forbidden in ("hashlib", "sha256(", "Detector(", "inspect_file(", "ThreatTrail("): assert forbidden not in source
 
-
 def test_ux_refresh_phase3_manual_internal_label_is_presented_as_custom_scan():
+    import re
     source = (Path(__file__).resolve().parents[1] / "app/ui/components/scan_progress.py").read_text(encoding="utf-8")
-    assert '"manual":"Custom Scan"' in source and '"manual":"Manual Scan"' not in source
+    assert re.search(r'["\']manual["\']\s*:\s*["\']Custom Scan["\']', source)
+    assert not re.search(r'["\']manual["\']\s*:\s*["\']Manual Scan["\']', source)
