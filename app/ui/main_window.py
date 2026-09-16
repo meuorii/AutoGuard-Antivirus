@@ -1,46 +1,49 @@
 from __future__ import annotations
 from pathlib import Path
+
 import customtkinter as ctk
 
 from app.startup import AutoGuardServices
 from app.ui import theme
-from app.ui.controller import AutoGuardUIController
-from app.ui.messages import UIMessageBus
-from app.ui.sidebar import Sidebar
-from app.ui.dashboard import DashboardPage
-from app.ui.scan_page import ScanPage
-from app.ui.incidents_page import IncidentsPage
-from app.ui.threat_trail_page import ThreatTrailPage
-from app.ui.quarantine_page import QuarantinePage
-from app.ui.history_page import HistoryPage
-from app.ui.settings_page import SettingsPage
+from app.ui.activity_page import ActivityPage
 from app.ui.components import NotificationCenter
+from app.ui.controller import AutoGuardUIController
+from app.ui.dashboard import DashboardPage
+from app.ui.messages import UIMessageBus
+from app.ui.quarantine_page import QuarantinePage
+from app.ui.scan_page import ScanPage
+from app.ui.settings_page import SettingsPage
+from app.ui.sidebar import NAV_ITEMS, Sidebar
+from app.ui.threats_page import ThreatsPage
+
+DEFAULT_PAGE = "home"
+PAGE_CLASSES = {"home": DashboardPage, "scan": ScanPage, "threats": ThreatsPage, "quarantine": QuarantinePage, "activity": ActivityPage, "settings": SettingsPage}
+
+if tuple(PAGE_CLASSES) != tuple(key for key, _ in NAV_ITEMS): raise RuntimeError("Sidebar navigation and page registry are out of sync.")
+
 
 class MainWindow(ctk.CTk):
-    """Responsive shell. All blocking service calls are dispatched by controller."""
     def __init__(self, services: AutoGuardServices, *, initial_path: Path | None = None):
-        super().__init__(); ctk.set_appearance_mode("dark"); self.title("AutoGuard")
-        self.geometry("1320x820"); self.minsize(1080, 680); self.configure(fg_color=theme.BG); self.protocol("WM_DELETE_WINDOW", self._close)
-        self.bus = UIMessageBus(); self.controller = AutoGuardUIController(services, self.bus); self.notifications = NotificationCenter(self); self._closing = False
+        super().__init__()
+        ctk.set_appearance_mode("dark"); self.title("AutoGuard"); self.geometry("1320x820"); self.minsize(1080, 680); self.configure(fg_color=theme.BG); self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bus = UIMessageBus(); self.controller = AutoGuardUIController(services, self.bus); self.notifications = NotificationCenter(self); self._closing = False; self._active_page: str | None = None
         self.grid_rowconfigure(0, weight=1); self.grid_columnconfigure(1, weight=1)
         self.sidebar = Sidebar(self, self.show_page); self.sidebar.grid(row=0, column=0, sticky="nsw")
-        self.container = ctk.CTkFrame(self, fg_color=theme.BG, corner_radius=0); self.container.grid(row=0, column=1, sticky="nsew")
-        self.container.grid_rowconfigure(0, weight=1); self.container.grid_columnconfigure(0, weight=1)
-        self.pages = {
-            "dashboard": DashboardPage(self.container, self.controller), "scan": ScanPage(self.container, self.controller),
-            "incidents": IncidentsPage(self.container, self.controller), "threat_trail": ThreatTrailPage(self.container, self.controller),
-            "quarantine": QuarantinePage(self.container, self.controller), "history": HistoryPage(self.container, self.controller),
-            "settings": SettingsPage(self.container, self.controller),
-        }
+        self.container = ctk.CTkFrame(self, fg_color=theme.BG, corner_radius=0); self.container.grid(row=0, column=1, sticky="nsew"); self.container.grid_rowconfigure(0, weight=1); self.container.grid_columnconfigure(0, weight=1)
+        self.pages = {key: page_class(self.container, self.controller) for key, page_class in PAGE_CLASSES.items()}
         for page in self.pages.values(): page.grid(row=0, column=0, sticky="nsew")
-        self.current = "dashboard"; self.show_page("dashboard")
-        self.after(90, self._drain_messages); self.after(700, self._periodic_dashboard_refresh)
+        self.show_page(DEFAULT_PAGE); self.after(90, self._drain_messages); self.after(700, self._periodic_home_refresh)
         if initial_path is not None: self.after(450, lambda: self.controller.start_scan(initial_path))
 
+    @property
+    def active_page(self) -> str | None:
+        """The single source of truth for the currently visible page."""
+        return self._active_page
+
     def show_page(self, name: str) -> None:
-        if name not in self.pages: return
-        self.current = name; self.sidebar.set_active(name); page = self.pages[name]
-        page.tkraise(); page.on_show()
+        page = self.pages.get(name)
+        if page is None: return
+        self._active_page = name; self.sidebar.set_active(name); page.tkraise(); page.on_show()
 
     def _drain_messages(self) -> None:
         if self._closing: return
@@ -58,13 +61,14 @@ class MainWindow(ctk.CTk):
             elif message.kind == "quarantine_deleted": self.notifications.show("Quarantine", "Isolated object permanently deleted; audit metadata retained.", "warning")
         self.after(90, self._drain_messages)
 
-    def _periodic_dashboard_refresh(self) -> None:
+    def _periodic_home_refresh(self) -> None:
         if self._closing: return
-        if self.current == "dashboard": self.controller.refresh_dashboard()
-        self.after(2500, self._periodic_dashboard_refresh)
+        if self._active_page == "home": self.controller.refresh_dashboard()
+        self.after(2500, self._periodic_home_refresh)
 
     def _close(self) -> None:
         self._closing = True; self.controller.shutdown(); self.destroy()
+
 
 def launch_desktop(services: AutoGuardServices, initial_path: Path | None = None) -> None:
     """Create and run the Windows desktop UI on the caller/main thread."""
