@@ -1,16 +1,16 @@
 from __future__ import annotations
-import threading
-import time
+import threading, time, ast, re
 from pathlib import Path
 from types import SimpleNamespace
+from app.models import ScanResult, ScanStatus, ScanSummary, ScanType
 from app.database import Database
 from app.detector import Detector
-from app.models import ScanResult, ScanStatus, ScanSummary, ScanType
-from app.scanner import Scanner
+from app.scanner import Scanner, ScanInterruptedError
 from app.signatures import SignatureStore
 from app.threat_trail import ThreatTrail
 from app.ui.controller import AutoGuardUIController
 from app.ui.messages import UIMessageBus
+from app.incidents import IncidentStatus
 
 def wait_for(bus: UIMessageBus, kind: str, timeout: float = 2.0):
     deadline = time.monotonic() + timeout; seen = []
@@ -27,7 +27,7 @@ def test_message_bus_preserves_fifo_order():
 
 def test_message_bus_validates_kind_and_limit():
     bus = UIMessageBus()
-    try: bus.publish("   ")
+    try: bus.publish("    ")
     except ValueError: pass
     else: raise AssertionError("empty message kind should be rejected")
     try: bus.drain(0)
@@ -37,7 +37,7 @@ def test_message_bus_validates_kind_and_limit():
 class FakeScanner:
     def __init__(self): self.thread_id = None
     def count_scan_entries(self, *args, **kwargs): raise AssertionError("UI must not pre-count scan entries")
-    def scan(self, path, source, *, scan_type, on_result=None, on_discovered=None):
+    def scan(self, path, source, *, scan_type, interrupt_check=None, on_result=None, on_discovered=None):
         self.thread_id = threading.get_ident(); result = ScanResult(str(path), ScanStatus.SCANNED, "No threat detected.")
         if on_discovered: on_discovered(str(path), "file")
         if on_result: on_result(result)
@@ -48,11 +48,10 @@ def fake_services(scanner):
     return SimpleNamespace(scanner=scanner, scheduler=scheduler)
 
 def test_controller_dispatches_manual_scan_off_calling_thread():
-    bus = UIMessageBus(); scanner = FakeScanner(); controller = AutoGuardUIController(fake_services(scanner), bus); calling_thread = threading.get_ident()
-    started = time.monotonic(); controller.start_scan("example.txt", scan_type=ScanType.MANUAL); elapsed = time.monotonic() - started
-    message, seen = wait_for(bus, "scan_completed")
+    bus = UIMessageBus(); scanner = FakeScanner(); controller = AutoGuardUIController(fake_services(scanner), bus); calling_thread = threading.get_ident(); started = time.monotonic()
+    controller.start_scan("example.txt", scan_type=ScanType.MANUAL); elapsed = time.monotonic() - started; message, seen = wait_for(bus, "scan_completed")
     try:
-        assert elapsed < 0.03; assert scanner.thread_id is not None and scanner.thread_id != calling_thread
+        assert elapsed < 0.03 and scanner.thread_id is not None and scanner.thread_id != calling_thread
         discovered = next(item for item in seen if item.kind == "scan_discovered"); assert discovered.payload["discovered"] == 1 and discovered.payload["processed"] == 0
         progress = next(item for item in seen if item.kind == "scan_result"); assert progress.payload["processed"] == 1 and progress.payload["discovered"] == 1 and progress.payload["progress"] == 1.0
         assert message.payload["result"].session_id == "session-1"
@@ -61,45 +60,36 @@ def test_controller_dispatches_manual_scan_off_calling_thread():
 def test_controller_emits_task_failure_without_raising_on_ui_thread():
     class FailingScanner(FakeScanner):
         def scan(self, *args, **kwargs): raise PermissionError("simulated locked target")
-    bus = UIMessageBus(); controller = AutoGuardUIController(fake_services(FailingScanner()), bus); controller.start_scan("locked.bin")
-    failure, _ = wait_for(bus, "task_failed")
+    bus = UIMessageBus(); controller = AutoGuardUIController(fake_services(FailingScanner()), bus); controller.start_scan("locked.bin"); failure, _ = wait_for(bus, "task_failed")
     try: assert "PermissionError" in failure.payload["error"] and "simulated locked target" in failure.payload["error"]
     finally: controller.shutdown()
 
 def test_scan_progress_callback_failure_does_not_change_scanner_result(tmp_path):
-    database = Database(tmp_path / "autoguard.db"); database.initialize(); scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
-    target = tmp_path / "safe.txt"; target.write_text("harmless", encoding="utf-8")
+    database = Database(tmp_path / "autoguard.db"); database.initialize(); scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database)); target = tmp_path / "safe.txt"; target.write_text("harmless", encoding="utf-8")
     result = scanner.scan_file(target, on_result=lambda _: (_ for _ in ()).throw(RuntimeError("UI gone")))
     assert result.status is ScanStatus.SCANNED
 
 def test_scanner_single_pass_discovery_matches_emitted_results(tmp_path):
-    database = Database(tmp_path / "autoguard.db"); database.initialize(); scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
-    folder = tmp_path / "folder"; folder.mkdir(); (folder / "one.txt").write_text("one", encoding="utf-8"); nested = folder / "nested"; nested.mkdir(); (nested / "two.txt").write_text("two", encoding="utf-8")
+    database = Database(tmp_path / "autoguard.db"); database.initialize(); scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database)); folder = tmp_path / "folder"; folder.mkdir(); (folder / "one.txt").write_text("one", encoding="utf-8"); nested = folder / "nested"; nested.mkdir(); (nested / "two.txt").write_text("two", encoding="utf-8")
     discovered = []; emitted = []; summary = scanner.scan(folder, on_discovered=lambda path, kind: discovered.append((path, kind)), on_result=emitted.append)
-    assert len(discovered) == 2 == len(emitted) == len(summary.results)
-    assert {path for path, _ in discovered} == {result.path for result in summary.results}
+    assert len(discovered) == 2 == len(emitted) == len(summary.results); assert {path for path, _ in discovered} == {result.path for result in summary.results}
 
 def test_controller_never_runs_metadata_precount_before_scan():
-    bus = UIMessageBus(); scanner = FakeScanner(); controller = AutoGuardUIController(fake_services(scanner), bus); controller.start_scan("instant.txt")
-    _, seen = wait_for(bus, "scan_completed")
+    bus = UIMessageBus(); scanner = FakeScanner(); controller = AutoGuardUIController(fake_services(scanner), bus); controller.start_scan("instant.txt"); _, seen = wait_for(bus, "scan_completed")
     try:
         kinds = [m.kind for m in seen]; assert "scan_counting" not in kinds and "scan_total" not in kinds
         assert kinds.index("scan_started") < kinds.index("scan_discovered") < kinds.index("scan_result") < kinds.index("scan_completed")
     finally: controller.shutdown()
 
 def _ui_module_ast(relative_path: str):
-    import ast
-    project_root = Path(__file__).resolve().parents[1]
-    return ast.parse((project_root / relative_path).read_text(encoding="utf-8"))
+    project_root = Path(__file__).resolve().parents[1]; return ast.parse((project_root / relative_path).read_text(encoding="utf-8"))
 
 def _literal_assignment(tree, name: str):
-    import ast
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets): return ast.literal_eval(node.value)
     raise AssertionError(f"Assignment {name!r} not found")
 
 def _class_attribute_literal(tree, class_name: str, attribute: str):
-    import ast
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             for child in node.body:
@@ -112,7 +102,6 @@ def test_ux_refresh_phase1_exposes_exactly_six_top_level_pages():
     assert {"incidents", "threat_trail", "history"}.isdisjoint({key for key, _ in nav_items})
 
 def test_ux_refresh_phase1_page_registry_matches_navigation_without_legacy_pages():
-    import ast
     tree = _ui_module_ast("app/ui/main_window.py"); default_page = _literal_assignment(tree, "DEFAULT_PAGE"); page_classes = None
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "PAGE_CLASSES" for target in node.targets):
@@ -121,44 +110,31 @@ def test_ux_refresh_phase1_page_registry_matches_navigation_without_legacy_pages
     assert tuple(page_classes) == ("home", "scan", "threats", "quarantine", "activity", "settings")
     assert page_classes["home"] == "DashboardPage" and page_classes["threats"] == "ThreatsPage" and page_classes["activity"] == "ActivityPage"
     assert {"incidents", "threat_trail", "history"}.isdisjoint(page_classes)
-    dashboard, threats, activity = _ui_module_ast("app/ui/dashboard.py"), _ui_module_ast("app/ui/threats_page.py"), _ui_module_ast("app/ui/activity_page.py")
-    assert _class_attribute_literal(dashboard, "DashboardPage", "title") == "Home"
-    assert _class_attribute_literal(threats, "ThreatsPage", "title") == "Threats"
-    assert _class_attribute_literal(activity, "ActivityPage", "title") == "Activity"
+    assert _class_attribute_literal(_ui_module_ast("app/ui/dashboard.py"), "DashboardPage", "title") == "Home"
+    assert _class_attribute_literal(_ui_module_ast("app/ui/threats_page.py"), "ThreatsPage", "title") == "Threats"
+    assert _class_attribute_literal(_ui_module_ast("app/ui/activity_page.py"), "ActivityPage", "title") == "Activity"
 
 def _home_services(*, file_running=True, usb_running=True, scheduler_running=True, quick_running=False, full_running=False, incidents=(), sessions=(), details=None, quarantined=0):
     def health(running): return SimpleNamespace(running=running, status=SimpleNamespace(value="RUNNING" if running else "STOPPED"))
     class History:
         def recent_scans(self, limit): return list(sessions)[:limit]
         def get_scan(self, session_id): return (details or {}).get(session_id)
-
-    scheduler_health = SimpleNamespace(running=scheduler_running, quick_scan_running=quick_running, full_scan_running=full_running)
-    scheduler = SimpleNamespace(quick_paths=(), full_paths=(), settings=SimpleNamespace(quick_interval_hours=24.0, full_interval_days=7.0), health=lambda: scheduler_health)
+    scheduler = SimpleNamespace(quick_paths=(), full_paths=(), settings=SimpleNamespace(quick_interval_hours=24.0, full_interval_days=7.0), health=lambda: SimpleNamespace(running=scheduler_running, quick_scan_running=quick_running, full_scan_running=full_running))
     quarantine_items = [SimpleNamespace(state=SimpleNamespace(value="QUARANTINED")) for _ in range(quarantined)]
-    return SimpleNamespace(
-        file_monitor=SimpleNamespace(health=lambda: health(file_running)), usb_monitor=SimpleNamespace(health=lambda: health(usb_running)),
-        scheduler=scheduler, quarantine=SimpleNamespace(list_quarantined_items=lambda: quarantine_items),
-        incidents=SimpleNamespace(get_active_incidents=lambda: list(incidents)), scanner=SimpleNamespace(history=History()),
-    )
+    return SimpleNamespace(file_monitor=SimpleNamespace(health=lambda: health(file_running)), usb_monitor=SimpleNamespace(health=lambda: health(usb_running)), scheduler=scheduler, quarantine=SimpleNamespace(list_quarantined_items=lambda: quarantine_items), incidents=SimpleNamespace(get_active_incidents=lambda: list(incidents)), scanner=SimpleNamespace(history=History()))
 
 def test_ux_refresh_phase2_home_uses_only_four_user_facing_protection_states():
-    from app.incidents import IncidentStatus
     controller = AutoGuardUIController(_home_services(), UIMessageBus())
     try:
-        snapshot = controller._dashboard_snapshot()
-        assert snapshot["protection_state"] == {"key": "protected", "title": "Protected", "message": "Everything is working normally."}
-        controller.services = _home_services(quick_running=True)
-        assert controller._dashboard_snapshot()["protection_state"]["title"] == "Scanning"
-        controller.services = _home_services(incidents=(SimpleNamespace(status=IncidentStatus.OPEN),))
-        attention = controller._dashboard_snapshot()["protection_state"]
+        assert controller._dashboard_snapshot()["protection_state"] == {"key": "protected", "title": "Protected", "message": "Everything is working normally."}
+        controller.services = _home_services(quick_running=True); assert controller._dashboard_snapshot()["protection_state"]["title"] == "Scanning"
+        controller.services = _home_services(incidents=(SimpleNamespace(status=IncidentStatus.OPEN),)); attention = controller._dashboard_snapshot()["protection_state"]
         assert attention["title"] == "Attention needed" and attention["message"] == "AutoGuard found something that needs review."
-        controller.services = _home_services(file_running=False)
-        issue = controller._dashboard_snapshot()["protection_state"]
+        controller.services = _home_services(file_running=False); issue = controller._dashboard_snapshot()["protection_state"]
         assert issue["title"] == "Protection issue" and issue["message"] == "One or more protection services are not running."
     finally: controller.shutdown()
 
 def test_ux_refresh_phase2_contained_incident_does_not_force_attention_state():
-    from app.incidents import IncidentStatus
     controller = AutoGuardUIController(_home_services(incidents=(SimpleNamespace(status=IncidentStatus.CONTAINED),)), UIMessageBus())
     try:
         snapshot = controller._dashboard_snapshot()
@@ -166,11 +142,8 @@ def test_ux_refresh_phase2_contained_incident_does_not_force_attention_state():
     finally: controller.shutdown()
 
 def test_ux_refresh_phase2_home_navigation_and_quick_scan_are_presentation_wired():
-    import ast
-    dashboard_path = Path(__file__).resolve().parents[1] / "app/ui/dashboard.py"
-    source = dashboard_path.read_text(encoding="utf-8"); tree = ast.parse(source)
+    source = (Path(__file__).resolve().parents[1] / "app/ui/dashboard.py").read_text(encoding="utf-8"); tree = ast.parse(source)
     strings = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
-
     assert {"Last Scan", "Threats", "Quarantine", "Protection", "Recent Activity", "Run Quick Scan", "View activity"} <= strings
     assert "start_quick_scan" in source and 'navigate_to("activity")' in source
     for forbidden in ("SHA-256", "incident ID", "session ID", "worker name"): assert forbidden not in source
@@ -184,25 +157,50 @@ def test_ux_refresh_phase2_view_activity_request_uses_message_bus():
 
 def test_ux_refresh_phase3_idle_scan_page_uses_simple_user_facing_choices():
     source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8")
-    assert 'text="Scan your PC"' in source and 'title="Quick Scan"' in source and 'title="Full Scan"' in source and 'title="Custom Scan"' in source
-    assert 'recommended=True' in source and "Downloads  •  Desktop  •  Documents" in source
-    assert '"Start Quick Scan", self.controller.start_quick_scan' in source and '"Start Full Scan", self.controller.start_full_scan' in source
-    assert '"Choose File", self._choose_file' in source and '"Choose Folder", self._choose_folder' in source and "Manual Scan" not in source
+    for req in ('text="Scan your PC"', 'title="Quick Scan"', 'title="Full Scan"', 'title="Custom Scan"', 'recommended=True', "Downloads  •  Desktop  •  Documents", '"Start Quick Scan", self.controller.start_quick_scan', '"Start Full Scan", self.controller.start_full_scan', '"Choose File", self._choose_file', '"Choose Folder", self._choose_folder'): assert req in source
+    assert "Manual Scan" not in source
 
 def test_ux_refresh_phase3_custom_scan_delegates_to_controller_without_scanner_logic():
-    import ast
     source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8"); tree = ast.parse(source)
-    controller_calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name)
-        and node.value.value.id == "self" and node.value.attr == "controller"
-    ]
-    names = {node.attr for node in controller_calls}
-    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= names
+    controller_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == "self" and node.value.attr == "controller"]
+    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= {node.attr for node in controller_calls}
     for forbidden in ("hashlib", "sha256(", "Detector(", "inspect_file(", "ThreatTrail("): assert forbidden not in source
 
 def test_ux_refresh_phase3_manual_internal_label_is_presented_as_custom_scan():
-    import re
     source = (Path(__file__).resolve().parents[1] / "app/ui/components/scan_progress.py").read_text(encoding="utf-8")
-    assert re.search(r'["\']manual["\']\s*:\s*["\']Custom Scan["\']', source)
-    assert not re.search(r'["\']manual["\']\s*:\s*["\']Manual Scan["\']', source)
+    assert re.search(r'["\']manual["\']\s*:\s*["\']Custom Scan["\']', source) and not re.search(r'["\']manual["\']\s*:\s*["\']Manual Scan["\']', source)
+
+def test_ux_refresh_phase4_active_scan_is_focused_and_has_no_fake_pause():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/components/active_scan.py").read_text(encoding="utf-8")
+    for required in ("Files checked", "Threats found", "Currently checking", "More details", "Discovered", "Processed", "Skipped", "Errors", "Suspicious", "Dangerous", "Stop Scan"): assert required in source
+    for forbidden in ("Pause", "hashlib", "inspect_file(", "Detector("): assert forbidden not in source
+
+def test_ux_refresh_phase4_scan_page_uses_active_component_and_stop_controller():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/scan_page.py").read_text(encoding="utf-8")
+    for req in ("ActiveScanPanel", "on_stop=self.controller.stop_scan", 'message.kind == "scan_stop_requested"', 'message.kind == "scan_stopped"'): assert req in source
+    for forbidden in ("Live results", "CTkTextbox"): assert forbidden not in source
+
+def test_ux_refresh_phase4_stop_scan_uses_cooperative_interrupt_without_blocking_ui():
+    class InterruptibleScanner(FakeScanner):
+        def __init__(self): super().__init__(); self.worker_started = threading.Event(); self.received_interrupt_check = False
+        def scan(self, path, source, *, scan_type, interrupt_check=None, on_result=None, on_discovered=None):
+            self.thread_id = threading.get_ident(); self.received_interrupt_check = callable(interrupt_check); self.worker_started.set()
+            if on_discovered: on_discovered(str(path), "file")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if interrupt_check is not None and interrupt_check(): raise ScanInterruptedError("Scan interrupted before completion.", "session-stop")
+                time.sleep(0.005)
+            raise AssertionError("Stop Scan did not reach the scanner interrupt hook")
+    bus = UIMessageBus(); scanner = InterruptibleScanner(); controller = AutoGuardUIController(fake_services(scanner), bus); calling_thread = threading.get_ident()
+    try:
+        controller.start_scan("large-folder"); assert scanner.worker_started.wait(1.0); started = time.monotonic()
+        assert controller.stop_scan() is True and time.monotonic() - started < 0.05
+        stopped, seen = wait_for(bus, "scan_stopped")
+        assert scanner.received_interrupt_check and scanner.thread_id != calling_thread and stopped.payload["session_id"] == "session-stop"
+        assert not any(message.kind == "task_failed" for message in seen) and not any(message.kind == "scan_completed" for message in seen)
+    finally: controller.shutdown()
+
+def test_ux_refresh_phase4_stop_scan_is_noop_when_no_ui_scan_is_running():
+    controller = AutoGuardUIController(fake_services(FakeScanner()), UIMessageBus())
+    try: assert controller.stop_scan() is False
+    finally: controller.shutdown()
