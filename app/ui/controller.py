@@ -11,11 +11,11 @@ from app.ui.messages import UIMessageBus
 
 class AutoGuardUIController:
     def __init__(self, services: AutoGuardServices, bus: UIMessageBus | None = None) -> None:
-        self.services, self.bus = services, bus if bus is not None else UIMessageBus()
-        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="AutoGuardUI")
-        self._lock = threading.RLock(); self._active_tasks: set[str] = set()
+        self.services = services; self.bus = bus if bus is not None else UIMessageBus()
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="AutoGuardUI"); self._lock = threading.RLock(); self._active_tasks: set[str] = set()
 
     def shutdown(self) -> None: self._executor.shutdown(wait=False, cancel_futures=False)
+
     def active_tasks(self) -> tuple[str, ...]:
         with self._lock: return tuple(sorted(self._active_tasks))
 
@@ -25,32 +25,93 @@ class AutoGuardUIController:
         def runner() -> None:
             try:
                 result = operation(); self.bus.publish(success_kind, task=task_name, result=result)
-            except Exception as error:
-                self.bus.publish("task_failed", task=task_name, error=f"{type(error).__name__}: {error}")
+            except Exception as error: self.bus.publish("task_failed", task=task_name, error=f"{type(error).__name__}: {error}")
             finally:
                 with self._lock: self._active_tasks.discard(task_name)
                 self.bus.publish("task_finished", task=task_name, active_tasks=self.active_tasks())
         self._executor.submit(runner)
 
+    def navigate_to(self, page: str) -> None:
+        self.bus.publish("navigate", page=page)
+
     def refresh_dashboard(self) -> None: self._submit("refresh-dashboard", self._dashboard_snapshot, "dashboard_data")
+
+    @staticmethod
+    def _health_running(health: Any | None) -> bool:
+        if health is None or not bool(getattr(health, "running", False)): return False
+        status = getattr(getattr(health, "status", None), "value", None)
+        return status is None or str(status).upper() == "RUNNING"
+
+    @staticmethod
+    def _display_name(path: str) -> str:
+        if "\\" in path: return path.rstrip("\\").rsplit("\\", 1)[-1]
+        return Path(path).name or path
+
+    @staticmethod
+    def _scan_label(scan_type: ScanType) -> str:
+        return {ScanType.QUICK: "Quick Scan", ScanType.FULL: "Full Scan", ScanType.MANUAL: "Custom Scan", ScanType.STARTUP: "Startup scan", ScanType.SCHEDULED: "Scheduled scan", ScanType.USB: "USB scan"}.get(scan_type, "Scan")
+
     def _dashboard_snapshot(self) -> dict[str, Any]:
         file_health = self.services.file_monitor.health() if self.services.file_monitor else None
         usb_health = self.services.usb_monitor.health() if self.services.usb_monitor else None
-        scheduler_health = self.services.scheduler.health()
-        quarantine = self.services.quarantine.list_quarantined_items()
-        active_incidents = self.services.incidents.get_active_incidents()
-        recent = self.services.scanner.history.recent_scans(8); recent_detections: list[dict[str, Any]] = []
-        for session in recent:
-            details = self.services.scanner.history.get_scan(session.id)
-            if details is None: continue
-            for result in reversed(details.results):
-                if result.detection_status in (DetectionStatus.HIGH_CONFIDENCE, DetectionStatus.LOW_CONFIDENCE):
-                    recent_detections.append({"path": result.path, "status": result.detection_status.value, "reason": result.detection_reason or result.reason, "recorded_at": result.recorded_at.isoformat()})
-                    if len(recent_detections) >= 5: break
-            if len(recent_detections) >= 5: break
-        return {"file_monitor": file_health, "usb_monitor": usb_health, "scheduler": scheduler_health, "quarantined_count": sum(1 for item in quarantine if item.state.value == "QUARANTINED"), "active_incidents": len(active_incidents), "recent_scans": recent, "recent_detections": recent_detections, "active_tasks": self.active_tasks(), "monitor_paths": tuple(str(path) for path in (self.services.file_monitor.monitored_paths() if self.services.file_monitor else ()))}
+        scheduler_health = self.services.scheduler.health(); quarantine = self.services.quarantine.list_quarantined_items()
+        active_incidents = self.services.incidents.get_active_incidents(); recent = self.services.scanner.history.recent_scans(16)
+        protection = {"real_time": self._health_running(file_health), "usb": self._health_running(usb_health), "scheduled": bool(getattr(scheduler_health, "running", False))}
+        protection_ok = all(protection.values())
+        review_statuses = {IncidentStatus.OPEN, IncidentStatus.INVESTIGATING, IncidentStatus.REAPPEARED}
+        threats_needing_review = sum(1 for incident in active_incidents if incident.status in review_statuses)
+        active_tasks = self.active_tasks()
+        ui_scan_running = any(task == "quick-scan" or task == "full-scan" or task.startswith("scan:") for task in active_tasks)
+        scheduler_scan_running = bool(getattr(scheduler_health, "quick_scan_running", False) or getattr(scheduler_health, "full_scan_running", False))
+        scan_running = ui_scan_running or scheduler_scan_running
+        if not protection_ok: protection_state = {"key": "issue", "title": "Protection issue", "message": "One or more protection services are not running."}
+        elif threats_needing_review: protection_state = {"key": "attention", "title": "Attention needed", "message": "AutoGuard found something that needs review."}
+        elif scan_running: protection_state = {"key": "scanning", "title": "Scanning", "message": "AutoGuard is currently checking your files."}
+        else: protection_state = {"key": "protected", "title": "Protected", "message": "Everything is working normally."}
+        visible_scan_types = {ScanType.QUICK, ScanType.FULL, ScanType.MANUAL, ScanType.STARTUP, ScanType.SCHEDULED, ScanType.USB}
+        last_session = next((session for session in recent if session.scan_type in visible_scan_types), None)
+        if last_session is None: last_scan = {"value": "No scans yet", "detail": "Run a Quick Scan to get started"}
+        else:
+            label = self._scan_label(last_session.scan_type); when = last_session.finished_at or last_session.started_at; checked = int(last_session.counters.get("scanned_files", 0))
+            last_scan = {"value": label, "detail": f"{checked:,} {'file' if checked == 1 else 'files'} checked · {self._friendly_scan_status(last_session.status)}", "when": when}
+
+        return {
+            "protection_state": protection_state, "protection": protection, "scan_running": scan_running, "last_scan": last_scan,
+            "threats_needing_review": threats_needing_review, "quarantined_count": sum(1 for item in quarantine if item.state.value == "QUARANTINED"),
+            "recent_activity": self._recent_activity(recent, limit=5),
+        }
+
+    @staticmethod
+    def _friendly_scan_status(status: Any) -> str:
+        value = getattr(status, "value", str(status)).upper()
+        return {"RUNNING": "In progress", "COMPLETED": "Completed", "INCOMPLETE": "Finished with some files skipped", "FAILED": "Could not finish"}.get(value, "Finished")
+
+    def _recent_activity(self, sessions: list[Any], *, limit: int) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for session in sessions:
+            if len(events) >= limit: break
+            if session.scan_type in (ScanType.MATCHING_COPY, ScanType.RECOVERY): continue
+            details = self.services.scanner.history.get_scan(session.id); detection = None
+            if details is not None:
+                detection = next((result for result in reversed(details.results) if result.detection_status in (DetectionStatus.HIGH_CONFIDENCE, DetectionStatus.LOW_CONFIDENCE)), None)
+            if detection is not None:
+                dangerous = detection.detection_status is DetectionStatus.HIGH_CONFIDENCE
+                events.append({"title": "Threat detected" if dangerous else "Suspicious file detected", "detail": self._display_name(detection.path), "when": detection.recorded_at, "tone": "danger" if dangerous else "warning"})
+                continue
+
+            when = session.finished_at or session.started_at
+            if session.scan_type is ScanType.REAL_TIME:
+                events.append({"title": "File scanned", "detail": self._display_name(session.source_path), "when": when, "tone": "success"})
+                continue
+
+            label = self._scan_label(session.scan_type); running = getattr(session.status, "value", str(session.status)).upper() == "RUNNING"
+            title = "USB drive scan started" if session.scan_type is ScanType.USB and running else ("USB drive scanned" if session.scan_type is ScanType.USB else (f"{label} started" if running else f"{label} completed"))
+            checked = int(session.counters.get("scanned_files", 0)); detail = f"{checked:,} {'file' if checked == 1 else 'files'} checked" if checked else self._friendly_scan_status(session.status)
+            events.append({"title": title, "detail": detail, "when": when, "tone": "success" if getattr(session.status, "value", "") == "COMPLETED" else "info"})
+        return events[:limit]
 
     def load_incidents(self) -> None: self._submit("load-incidents", self._incident_rows, "incidents_data")
+
     def _incident_rows(self) -> list[dict[str, Any]]:
         with self.services.database.connection() as connection:
             ids = [row["id"] for row in connection.execute("SELECT id FROM threat_incidents ORDER BY last_observed_at DESC, rowid DESC LIMIT 200").fetchall()]
@@ -73,6 +134,7 @@ class AutoGuardUIController:
     def load_history(self) -> None: self._submit("load-history", lambda: self.services.scanner.history.recent_scans(100), "history_data")
     def load_scan_report(self, session_id: str) -> None: self._submit(f"report:{session_id}", lambda: self.services.reports.build_scan_report(session_id), "scan_report_data")
 
+    # ---------- Scan work ----------
     def start_scan(self, path: str | Path, *, scan_type: ScanType = ScanType.MANUAL) -> None:
         target = Path(path); task = f"scan:{target}"; self.bus.publish("scan_started", path=str(target), scan_type=scan_type.value)
         def scan():
@@ -100,10 +162,18 @@ class AutoGuardUIController:
             return [self.services.scanner.scan(path, ScanSource.MANUAL, scan_type=scan_type, on_result=on_result, on_discovered=on_discovered) for path in existing]
         self._submit(task, run_batch, "scan_batch_completed")
 
+    # ---------- Quarantine / recovery ----------
     def verify_quarantine(self, quarantine_id: str) -> None: self._submit(f"verify-quarantine:{quarantine_id}", lambda: self.services.quarantine.verify_integrity(quarantine_id), "quarantine_verified")
     def restore_quarantine(self, quarantine_id: str, destination: str | Path | None = None) -> None: self._submit(f"restore:{quarantine_id}", lambda: self.services.recovery.restore(quarantine_id, destination), "recovery_completed")
     def delete_quarantine(self, quarantine_id: str) -> None: self._submit(f"delete-quarantine:{quarantine_id}", lambda: self.services.quarantine.delete_quarantine_object(quarantine_id), "quarantine_deleted")
     def verify_incident_cleanup(self, incident_id: str) -> None: self._submit(f"verify-incident:{incident_id}", lambda: self.services.cleanup_verifier.verify_incident(incident_id), "incident_verified")
 
+    # ---------- Settings/status ----------
     def settings_snapshot(self) -> dict[str, Any]:
-        return {"database": str(self.services.config.database_path), "quarantine": str(self.services.config.quarantine_dir), "max_file_size_bytes": self.services.config.max_file_size_bytes, "monitor_paths": tuple(str(p) for p in (self.services.file_monitor.monitored_paths() if self.services.file_monitor else ())), "quick_hours": self.services.scheduler.settings.quick_interval_hours, "full_days": self.services.scheduler.settings.full_interval_days, "file_monitor_enabled": self.services.file_monitor is not None, "usb_monitor_enabled": self.services.usb_monitor is not None}
+        return {
+            "database": str(self.services.config.database_path), "quarantine": str(self.services.config.quarantine_dir),
+            "max_file_size_bytes": self.services.config.max_file_size_bytes,
+            "monitor_paths": tuple(str(p) for p in (self.services.file_monitor.monitored_paths() if self.services.file_monitor else ())),
+            "quick_hours": self.services.scheduler.settings.quick_interval_hours, "full_days": self.services.scheduler.settings.full_interval_days,
+            "file_monitor_enabled": self.services.file_monitor is not None, "usb_monitor_enabled": self.services.usb_monitor is not None,
+        }
