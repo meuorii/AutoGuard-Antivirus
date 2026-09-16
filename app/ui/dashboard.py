@@ -17,7 +17,6 @@ class _SummaryBlock(ctk.CTkFrame):
     def set(self, value: str, detail: str = "") -> None:
         self.value.configure(text=value); self.detail.configure(text=detail)
 
-
 class _ProtectionRow(ctk.CTkFrame):
     def __init__(self, master, label: str, description: str):
         super().__init__(master, fg_color="transparent", corner_radius=0)
@@ -31,7 +30,6 @@ class _ProtectionRow(ctk.CTkFrame):
     def set(self, enabled: bool) -> None:
         self.state.configure(text="On" if enabled else "Off", text_color=theme.SUCCESS if enabled else theme.TEXT_MUTED, fg_color=theme.SUCCESS_DARK if enabled else theme.SURFACE_ALT)
 
-
 class _ActivityRow(ctk.CTkFrame):
     def __init__(self, master, title: str, detail: str, when: datetime | None, tone: str):
         super().__init__(master, fg_color="transparent", corner_radius=0)
@@ -42,13 +40,11 @@ class _ActivityRow(ctk.CTkFrame):
         ctk.CTkLabel(self, text=detail, text_color=theme.TEXT_MUTED, font=(theme.FONT, 9), anchor="w").grid(row=1, column=1, pady=(2, 0), sticky="ew")
         ctk.CTkLabel(self, text=_format_when(when), text_color=theme.TEXT_DIM, font=(theme.FONT, 9), anchor="e").grid(row=0, column=2, rowspan=2, padx=(16, 0), sticky="e")
 
-
 def _format_when(value: datetime | None) -> str:
     if value is None: return ""
     local = value.astimezone(); now = datetime.now().astimezone()
     if local.date() == now.date(): return f"Today · {local.strftime('%I:%M %p').lstrip('0')}"
     return local.strftime("%b %d · %I:%M %p").replace(" 0", " ")
-
 
 class DashboardPage(BasePage):
     title = "Home"; subtitle = "A simple view of your protection"
