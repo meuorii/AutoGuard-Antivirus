@@ -29,14 +29,17 @@ class QuarantinePage(BasePage):
         self._detail_data: dict | None = None
         self._list_data: dict | None = None
         self._notice: dict | None = None
+        self._loading = False
 
     def on_show(self):
         if self.controller.selected_quarantine_ref:
             self._detail_ref = self.controller.selected_quarantine_ref
+            self._loading = True
             self._show_loading("Loading file details…")
             self.controller.load_quarantine_details(self._detail_ref)
         else:
             self._detail_ref = None
+            self._loading = True
             self._show_loading("Loading quarantine…")
             self.controller.load_quarantine()
 
@@ -47,23 +50,29 @@ class QuarantinePage(BasePage):
         kind = message.kind
         if kind == "quarantine_data" and self._detail_ref is None:
             result = dict(message.payload.get("result", {}))
-            if result != self._list_data:
+            was_loading = self._loading
+            self._loading = False
+            if was_loading or result != self._list_data:
                 self._list_data = result
                 self._render_list(result)
         elif kind == "quarantine_details_requested":
             self._detail_ref = message.payload.get("item_ref")
             self._detail_data = None
+            self._loading = True
             self._show_loading("Loading file details…")
             self.controller.load_quarantine_details(self._detail_ref)
         elif kind == "quarantine_details_data":
             result = message.payload.get("result", {})
             if self._detail_ref and result.get("item_ref") == self._detail_ref:
-                if result != self._detail_data:
+                was_loading = self._loading
+                self._loading = False
+                if was_loading or result != self._detail_data:
                     self._detail_data = result
                     self._render_details(result)
         elif kind == "quarantine_details_closed":
             self._detail_ref = None
             self._detail_data = None
+            self._loading = True
             self._show_loading("Loading quarantine…")
             self.controller.load_quarantine()
         elif kind == "quarantine_verified":

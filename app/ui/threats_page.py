@@ -34,13 +34,14 @@ class ThreatsPage(BasePage):
         self._loading = False
         self._detail_ref = None
         self._detail_data: dict | None = None
-        self._list_data: tuple[dict, ...] = ()
+        self._list_data: tuple[dict, ...] | None = None
         self._render_loading()
 
     def on_show(self) -> None:
         selected = self.controller.selected_threat_ref
         if selected:
             self._detail_ref = selected
+            self._loading = True
             self._render_details_loading()
             self.controller.load_threat_details(selected)
             return
@@ -59,12 +60,14 @@ class ThreatsPage(BasePage):
         if message.kind == "threat_details_requested":
             self._detail_ref = message.payload.get("threat_ref")
             if self._detail_ref:
+                self._loading = True
                 self._render_details_loading()
         elif message.kind == "threat_details_data":
             if self._detail_ref:
                 result = dict(message.payload.get("result", {}))
+                was_loading = self._loading
                 self._loading = False
-                if result != self._detail_data:
+                if was_loading or result != self._detail_data:
                     self._detail_data = result
                     self._render_details(result)
         elif message.kind == "threat_details_closed":
@@ -75,16 +78,57 @@ class ThreatsPage(BasePage):
             self.controller.load_threats()
         elif message.kind == "threats_data" and not self._detail_ref:
             rows = tuple(message.payload.get("result", ()))
+            was_loading = self._loading
             self._loading = False
-            if rows != self._list_data:
+            if was_loading or self._list_data is None or rows != self._list_data:
                 self._list_data = rows
                 self._render(rows)
+        elif message.kind == "task_failed":
+            task = str(message.payload.get("task", ""))
+            error = str(message.payload.get("error", "Unable to load threat data."))
+            if task == "load-threats" and not self._detail_ref:
+                self._loading = False
+                self._render_load_error(error, details=False)
+            elif task.startswith("load-threat-details:") and self._detail_ref:
+                self._loading = False
+                self._render_load_error(error, details=True)
         elif message.kind in {"incident_verified", "quarantine_deleted", "recovery_completed"}:
             if self._detail_ref:
                 self.controller.load_threat_details(self._detail_ref)
             else:
                 self.controller.load_threats()
 
+    def _render_load_error(self, error: str, *, details: bool) -> None:
+        self.clear_body()
+        self.body.grid_columnconfigure(0, weight=1)
+        card = ctk.CTkFrame(
+            self.body, fg_color=theme.SURFACE, border_width=1,
+            border_color=theme.BORDER, corner_radius=theme.RADIUS,
+        )
+        card.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            card, text="Threat data could not be loaded",
+            font=(theme.FONT, 15, "bold"), text_color=theme.TEXT, anchor="w",
+        ).grid(row=0, column=0, padx=16, pady=(15, 4), sticky="ew")
+        ctk.CTkLabel(
+            card, text="AutoGuard is still protecting your computer. Try loading this view again.",
+            font=(theme.FONT, 10), text_color=theme.TEXT_MUTED, anchor="w",
+            justify="left", wraplength=760,
+        ).grid(row=1, column=0, padx=16, sticky="ew")
+        ctk.CTkLabel(
+            card, text=error, font=(theme.FONT, 9), text_color=theme.TEXT_DIM,
+            anchor="w", justify="left", wraplength=760,
+        ).grid(row=2, column=0, padx=16, pady=(6, 10), sticky="ew")
+        retry = (
+            (lambda: self.controller.load_threat_details(self._detail_ref))
+            if details else self.controller.load_threats
+        )
+        ctk.CTkButton(
+            card, text="Retry", width=90, height=30, command=retry,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            text_color=theme.BG,
+        ).grid(row=3, column=0, padx=16, pady=(0, 15), sticky="w")
 
     def _render_details_loading(self) -> None:
         self.clear_body()

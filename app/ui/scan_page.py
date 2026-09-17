@@ -184,19 +184,27 @@ class ScanPage(BasePage):
             )
 
         elif message.kind == "scan_result":
-            status = message.payload["status"]
-            detection = message.payload.get("detection")
-            if status == ScanStatus.SCANNED.value:
-                self.counts["scanned"] += 1
-            elif status == ScanStatus.ERROR.value:
-                self.counts["errors"] += 1
+            cumulative = message.payload.get("counts")
+            if cumulative is not None:
+                # Performance hotfix: the controller may coalesce many per-file
+                # callbacks into one UI paint. Cumulative counters keep the UI exact.
+                self.counts = {
+                    key: int(cumulative.get(key, 0)) for key in self.counts
+                }
             else:
-                self.counts["skipped"] += 1
-
-            if detection == "LOW_CONFIDENCE":
-                self.counts["suspicious"] += 1
-            elif detection == "HIGH_CONFIDENCE":
-                self.counts["dangerous"] += 1
+                # Backward-compatible path for older controller messages/tests.
+                status = message.payload["status"]
+                detection = message.payload.get("detection")
+                if status == ScanStatus.SCANNED.value:
+                    self.counts["scanned"] += 1
+                elif status == ScanStatus.ERROR.value:
+                    self.counts["errors"] += 1
+                else:
+                    self.counts["skipped"] += 1
+                if detection == "LOW_CONFIDENCE":
+                    self.counts["suspicious"] += 1
+                elif detection == "HIGH_CONFIDENCE":
+                    self.counts["dangerous"] += 1
 
             self.active_scan.update_progress(
                 processed=message.payload.get("processed", 0),

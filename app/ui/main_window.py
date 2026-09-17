@@ -61,7 +61,7 @@ GLOBAL_STATUS_EVENTS = {
     "scan_result_ready", "incident_verified", "quarantine_deleted",
     "recovery_completed", "settings_applied",
 }
-PASSIVE_REFRESH_MS = 3000
+PASSIVE_REFRESH_MS = 10000
 
 
 class MainWindow(ctk.CTk):
@@ -138,7 +138,15 @@ class MainWindow(ctk.CTk):
                     "issue": "failed",
                 }.get(key, "stopped")
                 self.sidebar.set_protection(state.get("title", "Checking"), sidebar_status)
-            for page in self.pages.values():
+            # High-frequency scan progress belongs to the persistent Scan page only.
+            # Routing every file event through all six pages was a major source of UI
+            # churn during large scans. Low-frequency lifecycle/data messages still
+            # reach every page so hidden page state remains compatible.
+            if message.kind in {"scan_discovered", "scan_result"}:
+                recipients = (self.pages["scan"],)
+            else:
+                recipients = tuple(self.pages.values())
+            for page in recipients:
                 try:
                     page.handle_message(message)
                 except Exception:

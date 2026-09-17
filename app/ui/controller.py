@@ -8,6 +8,7 @@ inside the existing service modules.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from dataclasses import asdict
@@ -511,10 +512,20 @@ class AutoGuardUIController:
 
     def _threat_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for incident in self.services.incidents.list_incidents(200):
-            details = self.services.incidents.get_incident(incident.id)
-            if details is None:
-                continue
+        # One snapshot replaces the previous N+1 list_incidents()+get_incident()
+        # read pattern in production. The compatibility fallback keeps lightweight
+        # test/adaptor services working without requiring the new optional method.
+        incident_service = self.services.incidents
+        if hasattr(incident_service, "list_incident_details"):
+            detail_rows = incident_service.list_incident_details(200)
+        else:
+            detail_rows = []
+            for summary in incident_service.list_incidents(200):
+                detail = incident_service.get_incident(summary.id)
+                if detail is not None:
+                    detail_rows.append(detail)
+        for details in detail_rows:
+            incident = details.incident
             status_label, section = self._THREAT_STATUS_LABELS[incident.status]
             files = tuple(details.files)
             location_count = len(files)
@@ -1502,6 +1513,74 @@ class AutoGuardUIController:
         self.bus.publish("scan_stop_requested", task=task)
         return True
 
+    @staticmethod
+    def _new_progress_state() -> dict[str, Any]:
+        return {
+            "discovered": 0, "processed": 0, "last_emit": 0.0,
+            "scanned": 0, "skipped": 0, "suspicious": 0,
+            "dangerous": 0, "errors": 0, "last_path": "",
+            "result_emitted": False,
+        }
+
+    def _emit_scan_progress(
+        self, state: dict[str, Any], *, task: str, result: ScanResult | None = None,
+        path: str = "", force: bool = False, discovered_only: bool = False,
+    ) -> None:
+        """Throttle presentation updates without throttling the scanner itself.
+
+        Backend scanning/persistence still processes every file. The UI receives
+        at most ~8 progress paints/sec, with immediate first/detection/final
+        updates, avoiding tens of thousands of Tk messages on large scans.
+        """
+        now = time.monotonic()
+        if path:
+            state["last_path"] = path
+        if result is not None:
+            state["processed"] += 1
+            state["discovered"] = max(state["discovered"], state["processed"] )
+            if result.status is ScanStatus.SCANNED:
+                state["scanned"] += 1
+            elif result.status is ScanStatus.ERROR:
+                state["errors"] += 1
+            else:
+                state["skipped"] += 1
+            detection = result.detection.status if result.detection else None
+            if detection is DetectionStatus.LOW_CONFIDENCE:
+                state["suspicious"] += 1
+            elif detection is DetectionStatus.HIGH_CONFIDENCE:
+                state["dangerous"] += 1
+                force = True
+        first = state["last_emit"] == 0.0
+        first_result = result is not None and not state["result_emitted"]
+        if first_result:
+            force = True
+        if not (force or first or now - state["last_emit"] >= 0.125):
+            return
+        state["last_emit"] = now
+        payload = {
+            "path": state["last_path"],
+            "processed": state["processed"],
+            "discovered": state["discovered"],
+            "progress": (state["processed"] / state["discovered"]) if state["discovered"] else 0.0,
+            "task": task,
+            "counts": {key: state[key] for key in (
+                "scanned", "skipped", "suspicious", "dangerous", "errors"
+            )},
+        }
+        if discovered_only and result is None:
+            self.bus.publish("scan_discovered", entry_kind="file", **payload)
+            return
+        if result is not None:
+            state["result_emitted"] = True
+            payload.update(
+                status=result.status.value,
+                detection=result.detection.status.value if result.detection else None,
+                reason=result.reason,
+            )
+            self.bus.publish("scan_result", **payload)
+        else:
+            self.bus.publish("scan_discovered", entry_kind="file", **payload)
+
     def start_scan(self, path: str | Path, *, scan_type: ScanType = ScanType.MANUAL) -> None:
         target = Path(path)
         task = f"scan:{target}"
@@ -1511,29 +1590,20 @@ class AutoGuardUIController:
         self.bus.publish("scan_started", path=str(target), scan_type=scan_type.value, task=task)
 
         def scan():
-            discovered = processed = 0
+            state = self._new_progress_state()
 
             def on_discovered(path: str, kind: str) -> None:
-                nonlocal discovered
-                discovered += 1
-                self.bus.publish(
-                    "scan_discovered", path=path, entry_kind=kind,
-                    discovered=discovered, processed=processed, task=task,
+                state["discovered"] += 1
+                self._emit_scan_progress(
+                    state, task=task, path=path, discovered_only=True
                 )
 
             def on_result(result: ScanResult) -> None:
-                nonlocal discovered, processed
-                processed += 1
-                discovered = max(discovered, processed)
-                detection = result.detection.status.value if result.detection else None
-                self.bus.publish(
-                    "scan_result", path=result.path, status=result.status.value,
-                    detection=detection, reason=result.reason, processed=processed,
-                    discovered=discovered,
-                    progress=(processed / discovered) if discovered else 0.0, task=task,
+                self._emit_scan_progress(
+                    state, task=task, result=result, path=result.path
                 )
 
-            return self.services.scanner.scan(
+            summary = self.services.scanner.scan(
                 target,
                 ScanSource.MANUAL,
                 scan_type=scan_type,
@@ -1541,6 +1611,12 @@ class AutoGuardUIController:
                 on_result=on_result,
                 on_discovered=on_discovered,
             )
+            # Ensure the visible counters land on their exact final values even
+            # when the last files were inside the throttle window.
+            self._emit_scan_progress(
+                state, task=task, path=state["last_path"], force=True
+            )
+            return summary
 
         self._submit(task, scan, "scan_completed")
 
@@ -1559,25 +1635,17 @@ class AutoGuardUIController:
 
         def run_batch() -> list[Any]:
             existing = tuple(path for path in paths if path.exists())
-            discovered = processed = 0
+            state = self._new_progress_state()
 
             def on_discovered(path: str, kind: str) -> None:
-                nonlocal discovered
-                discovered += 1
-                self.bus.publish(
-                    "scan_discovered", path=path, entry_kind=kind,
-                    discovered=discovered, processed=processed, task=task,
+                state["discovered"] += 1
+                self._emit_scan_progress(
+                    state, task=task, path=path, discovered_only=True
                 )
 
             def on_result(result: ScanResult) -> None:
-                nonlocal discovered, processed
-                processed += 1
-                discovered = max(discovered, processed)
-                self.bus.publish(
-                    "scan_result", path=result.path, status=result.status.value,
-                    detection=result.detection.status.value if result.detection else None,
-                    reason=result.reason, processed=processed, discovered=discovered,
-                    progress=(processed / discovered) if discovered else 0.0, task=task,
+                self._emit_scan_progress(
+                    state, task=task, result=result, path=result.path
                 )
 
             summaries: list[Any] = []
@@ -1594,6 +1662,9 @@ class AutoGuardUIController:
                         on_discovered=on_discovered,
                     )
                 )
+            self._emit_scan_progress(
+                state, task=task, path=state["last_path"], force=True
+            )
             return summaries
 
         self._submit(task, run_batch, "scan_batch_completed")

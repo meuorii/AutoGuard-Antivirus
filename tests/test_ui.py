@@ -1945,3 +1945,22 @@ def test_ux_refresh_phase12_user_facing_terminology_is_consistent():
     assert '"Threat resolved" if item.get("label") == "Incident resolved"' in threat_details
     for legacy in ('("incidents",', '("threat_trail",', '("history",'):
         assert legacy not in sidebar
+
+
+
+
+
+def test_loading_state_hotfix_renders_empty_or_unchanged_threat_data():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/threats_page.py").read_text(encoding="utf-8")
+    assert "self._list_data: tuple[dict, ...] | None = None" in source
+    assert "was_loading = self._loading" in source
+    assert "if was_loading or self._list_data is None or rows != self._list_data:" in source
+    assert "if was_loading or result != self._detail_data:" in source
+
+
+def test_loading_state_hotfix_applies_same_rule_to_quarantine_navigation():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
+    assert "self._loading = False" in source
+    assert "was_loading = self._loading" in source
+    assert "if was_loading or result != self._list_data:" in source
+    assert "if was_loading or result != self._detail_data:" in source
