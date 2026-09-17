@@ -1252,3 +1252,168 @@ def test_ux_refresh_phase8_component_adds_locations_and_timeline_without_restori
     assert "do not prove an infection source or direction of spread" in component
     assert 'text="Technical details  ▾"' in component and "grid_remove()" in component
     assert "Threat Trail" not in sidebar
+
+
+def _phase9_quarantine_services():
+    from datetime import datetime, timedelta, timezone
+    from app.incidents import IncidentStatus
+    from app.models import ScanSource
+    from app.quarantine import QuarantineIntegrityStatus, QuarantineState
+    from app.recovery import RecoveryStatus
+
+    base = datetime(2026, 9, 17, 1, 0, tzinfo=timezone.utc)
+    incident = SimpleNamespace(
+        id="incident-phase9",
+        sha256="c" * 64,
+        status=IncidentStatus.CONTAINED,
+        first_observed_path=r"c:\users\fonti\downloads\test-threat.bin",
+    )
+    details = SimpleNamespace(incident=incident, files=(), events=())
+    isolated = SimpleNamespace(
+        quarantine_id="quarantine-internal-phase9",
+        incident_id=incident.id,
+        original_path=r"c:\users\fonti\downloads\test-threat.bin",
+        stored_path=r"c:\users\fonti\autoguarddata\quarantine\hidden.agq",
+        sha256=incident.sha256,
+        original_size=2048,
+        created_at=base,
+        quarantined_at=base + timedelta(seconds=5),
+        reason="Exact stored signature match",
+        original_source=ScanSource.FILE_MONITOR,
+        state=QuarantineState.QUARANTINED,
+        integrity_status=QuarantineIntegrityStatus.VERIFIED,
+        verified_sha256=incident.sha256,
+        verified_size=2048,
+        verified_at=base + timedelta(seconds=5),
+        original_removed=True,
+        failure_reason=None,
+    )
+    deleted_audit = SimpleNamespace(
+        quarantine_id="deleted-audit-record",
+        incident_id=incident.id,
+        original_path=r"c:\users\fonti\desktop\old-copy.bin",
+        stored_path=r"c:\users\fonti\autoguarddata\quarantine\deleted.agq",
+        sha256=incident.sha256,
+        original_size=1024,
+        created_at=base,
+        quarantined_at=base,
+        reason="Previously isolated",
+        original_source=ScanSource.MANUAL,
+        state=QuarantineState.FAILED,
+        integrity_status=QuarantineIntegrityStatus.FAILED,
+        verified_sha256=None,
+        verified_size=None,
+        verified_at=None,
+        original_removed=True,
+        failure_reason="Quarantine object permanently deleted by user.",
+    )
+    recovery_attempt = SimpleNamespace(
+        status=RecoveryStatus.DESTINATION_CONFLICT,
+        finished_at=base + timedelta(minutes=4),
+    )
+
+    class Quarantine:
+        def list_quarantined_items(self):
+            return [isolated, deleted_audit]
+
+        def get_item(self, item_ref):
+            return isolated if item_ref == isolated.quarantine_id else None
+
+    class Incidents:
+        def get_incident(self, incident_id):
+            return details if incident_id == incident.id else None
+
+    class Recovery:
+        def list_attempts(self, item_ref):
+            return [recovery_attempt] if item_ref == isolated.quarantine_id else []
+
+    services = SimpleNamespace(
+        quarantine=Quarantine(),
+        incidents=Incidents(),
+        recovery=Recovery(),
+    )
+    return services, isolated
+
+
+def test_ux_refresh_phase9_quarantine_list_uses_safe_user_facing_rows_only():
+    services, isolated = _phase9_quarantine_services()
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        result = controller._quarantine_snapshot()
+    finally:
+        controller.shutdown()
+
+    assert result["isolated_count"] == 1
+    assert len(result["items"]) == 1
+    row = result["items"][0]
+    assert row["name"] == "test-threat.bin"
+    assert row["original_location"] == isolated.original_path
+    assert row["threat_status"] == "Contained"
+    rendered = str(row)
+    assert isolated.stored_path not in rendered
+    assert isolated.sha256 not in rendered
+    assert ".agq" not in rendered
+
+
+def test_ux_refresh_phase9_detail_read_model_contains_advanced_integrity_and_ids_without_storage_path():
+    services, isolated = _phase9_quarantine_services()
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        result = controller._quarantine_details_snapshot(isolated.quarantine_id)
+    finally:
+        controller.shutdown()
+
+    assert result["hash_verification"] == "Verified"
+    assert "SHA-256" in result["quarantine_integrity"]
+    assert result["sha256"] == isolated.sha256
+    assert result["quarantine_id"] == isolated.quarantine_id
+    assert result["incident_id"] == isolated.incident_id
+    assert result["original_location"] == isolated.original_path
+    assert result["latest_recovery"]["status"] == "Choose another destination"
+    assert "stored_path" not in result
+    assert isolated.stored_path not in str(result)
+
+
+def test_ux_refresh_phase9_main_quarantine_view_hides_storage_internals_and_has_required_states_actions():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
+    detail = (root / "app/ui/quarantine_details_page.py").read_text(encoding="utf-8")
+
+    for required in (
+        "safely isolated", "Original location:", 'text="View"',
+        'text="Restore"', 'text="Delete"', "No files are currently isolated",
+        "Loading quarantine", "Operation failed",
+    ):
+        assert required in page
+    for forbidden in (".agq", "stored_path", "sha256", "quarantine_id"):
+        assert forbidden not in page
+
+    assert 'text="Hash verification"' in detail
+    assert 'text="Quarantine integrity"' not in detail  # label is passed through _detail_row
+    assert '"Quarantine integrity"' in detail
+    assert '"SHA-256"' in detail
+    assert '"Internal quarantine ID"' in detail
+    assert '"Associated incident ID"' in detail
+
+
+def test_ux_refresh_phase9_restore_delete_verify_delegate_to_existing_services_off_ui_thread():
+    root = Path(__file__).resolve().parents[1]
+    controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
+    page = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
+
+    assert "self.services.quarantine.verify_integrity(quarantine_id)" in controller
+    assert "self.services.recovery.restore(quarantine_id, destination)" in controller
+    assert "self.services.quarantine.delete_quarantine_object(quarantine_id)" in controller
+    assert 'self._submit(f"verify-quarantine:{quarantine_id}"' in controller
+    assert 'self._submit(f"restore:{quarantine_id}"' in controller
+    assert 'self._submit(f"delete-quarantine:{quarantine_id}"' in controller
+    for forbidden in ("hashlib", "sha256(", "unlink(", "shutil.", "open("):
+        assert forbidden not in page
+
+
+def test_ux_refresh_phase9_delete_confirmation_is_user_facing_and_does_not_mention_agq():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
+    assert "Permanently delete isolated file" in page
+    assert "file can no longer be restored from quarantine" in page
+    assert ".agq" not in page

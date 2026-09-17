@@ -17,7 +17,7 @@ from app.cleanup_verifier import VerificationStatus
 from app.explanations import ExplanationContext, build_explanation
 from app.incidents import IncidentEventType, IncidentStatus
 from app.models import DetectionStatus, ScanResult, ScanSource, ScanStatus, ScanType
-from app.quarantine import QuarantineState
+from app.quarantine import QuarantineIntegrityStatus, QuarantineState
 from app.recovery import RecoveryStatus
 from app.scanner import ScanInterruptedError
 from app.startup import AutoGuardServices
@@ -34,6 +34,7 @@ class AutoGuardUIController:
         self._scan_cancel_events: dict[str, threading.Event] = {}
         self._current_scan_task: str | None = None
         self._selected_threat_ref: str | None = None
+        self._selected_quarantine_ref: str | None = None
 
     def shutdown(self) -> None:
         # Request cooperative interruption of a UI-launched scan before the
@@ -1068,12 +1069,141 @@ class AutoGuardUIController:
             return [dict(row) for row in rows]
         self._submit("load-threat-trail", load, "threat_trail_data")
 
+    # ---------- Quarantine read model ----------
+    @staticmethod
+    def _friendly_size(value: int | None) -> str:
+        if value is None:
+            return "Size unavailable"
+        size = float(max(0, value))
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit = units[0]
+        for candidate in units:
+            unit = candidate
+            if size < 1024 or candidate == units[-1]:
+                break
+            size /= 1024
+        if unit == "B":
+            return f"{int(size):,} B"
+        return f"{size:.1f} {unit}"
+
     def load_quarantine(self) -> None:
+        self._submit("load-quarantine", self._quarantine_snapshot, "quarantine_data")
+
+    def _quarantine_snapshot(self) -> dict[str, Any]:
+        """Return only user-facing list data for currently isolated files."""
+        items = tuple(self.services.quarantine.list_quarantined_items())
+        isolated = tuple(item for item in items if item.state is QuarantineState.QUARANTINED)
+        rows: list[dict[str, Any]] = []
+        for item in isolated:
+            details = self.services.incidents.get_incident(item.incident_id)
+            incident = details.incident if details is not None else None
+            if incident is not None:
+                threat_status, _ = self._THREAT_STATUS_LABELS.get(
+                    incident.status, ("Threat recorded", "Needs attention")
+                )
+                threat_status_key = {
+                    "Needs attention": "attention",
+                    "Being reviewed": "reviewing",
+                    "Contained": "contained",
+                    "Detected again": "reappeared",
+                    "Restored": "restored",
+                    "Resolved": "resolved",
+                }.get(threat_status, "attention")
+            else:
+                threat_status = "Threat recorded"
+                threat_status_key = "attention"
+            rows.append({
+                "item_ref": item.quarantine_id,
+                "name": self._display_name(item.original_path),
+                "contained": self._friendly_timestamp(item.quarantined_at or item.created_at),
+                "original_location": item.original_path,
+                "threat_status": threat_status,
+                "threat_status_key": threat_status_key,
+            })
+        return {"isolated_count": len(isolated), "items": rows}
+
+    @property
+    def selected_quarantine_ref(self) -> str | None:
+        return self._selected_quarantine_ref
+
+    def open_quarantine_details(self, item_ref: str) -> None:
+        if not item_ref:
+            return
+        self._selected_quarantine_ref = str(item_ref)
+        self.bus.publish("quarantine_details_requested", item_ref=self._selected_quarantine_ref)
+
+    def close_quarantine_details(self) -> None:
+        self._selected_quarantine_ref = None
+        self.bus.publish("quarantine_details_closed")
+
+    def load_quarantine_details(self, item_ref: str | None = None) -> None:
+        ref = str(item_ref or self._selected_quarantine_ref or "").strip()
+        if not ref:
+            return
         self._submit(
-            "load-quarantine",
-            self.services.quarantine.list_quarantined_items,
-            "quarantine_data",
+            f"load-quarantine-details:{ref}",
+            lambda: self._quarantine_details_snapshot(ref),
+            "quarantine_details_data",
         )
+
+    def _quarantine_details_snapshot(self, item_ref: str) -> dict[str, Any]:
+        item = self.services.quarantine.get_item(item_ref)
+        if item is None:
+            raise KeyError("The selected quarantined file is no longer available.")
+        details = self.services.incidents.get_incident(item.incident_id)
+        incident = details.incident if details is not None else None
+        if incident is not None:
+            threat_status, _ = self._THREAT_STATUS_LABELS.get(
+                incident.status, ("Threat recorded", "Needs attention")
+            )
+            threat_name = self._display_name(incident.first_observed_path)
+        else:
+            threat_status = "Threat recorded"
+            threat_name = self._display_name(item.original_path)
+
+        integrity = item.integrity_status
+        if integrity is QuarantineIntegrityStatus.VERIFIED:
+            verification_label = "Verified"
+            integrity_text = "Stored content matched the recorded SHA-256 and expected size at the latest verification."
+            integrity_key = "verified"
+        elif integrity is QuarantineIntegrityStatus.FAILED:
+            verification_label = "Verification failed"
+            integrity_text = item.failure_reason or "The stored content could not be verified."
+            integrity_key = "failed"
+        else:
+            verification_label = "Not verified yet"
+            integrity_text = "No completed integrity verification is recorded yet."
+            integrity_key = "pending"
+
+        attempts = tuple(self.services.recovery.list_attempts(item.quarantine_id))
+        latest_attempt = attempts[-1] if attempts else None
+        latest_recovery = None
+        if latest_attempt is not None:
+            latest_recovery = {
+                "status": self._recovery_status_text(latest_attempt.status)[0],
+                "when": self._friendly_timestamp(latest_attempt.finished_at),
+            }
+
+        return {
+            "item_ref": item.quarantine_id,
+            "name": self._display_name(item.original_path),
+            "contained": self._friendly_timestamp(item.quarantined_at or item.created_at),
+            "original_location": item.original_path,
+            "threat_name": threat_name,
+            "threat_status": threat_status,
+            "hash_verification": verification_label,
+            "integrity_key": integrity_key,
+            "quarantine_integrity": integrity_text,
+            "last_verified": self._friendly_timestamp(item.verified_at) if item.verified_at else "Not verified yet",
+            "sha256": item.sha256,
+            "quarantine_id": item.quarantine_id,
+            "incident_id": item.incident_id,
+            "original_size": self._friendly_size(item.original_size),
+            "original_removed": "Yes" if item.original_removed else "No",
+            "latest_recovery": latest_recovery,
+            "can_restore": item.state is QuarantineState.QUARANTINED,
+            "can_delete": item.state is QuarantineState.QUARANTINED,
+        }
 
     def load_history(self) -> None:
         self._submit(
@@ -1217,25 +1347,85 @@ class AutoGuardUIController:
 
     # ---------- Quarantine / recovery ----------
     def verify_quarantine(self, quarantine_id: str) -> None:
-        self._submit(
-            f"verify-quarantine:{quarantine_id}",
-            lambda: self.services.quarantine.verify_integrity(quarantine_id),
-            "quarantine_verified",
-        )
+        def verify() -> dict[str, Any]:
+            result = self.services.quarantine.verify_integrity(quarantine_id)
+            return {
+                "item_ref": quarantine_id,
+                "verified": bool(result.verified),
+                "title": "Integrity verified" if result.verified else "Integrity verification failed",
+                "message": (
+                    "The isolated file still matches its recorded SHA-256 and size."
+                    if result.verified
+                    else (result.error or "The isolated file could not be verified.")
+                ),
+            }
+        self._submit(f"verify-quarantine:{quarantine_id}", verify, "quarantine_verified")
+
+    @staticmethod
+    def _recovery_status_text(status: RecoveryStatus) -> tuple[str, str, str]:
+        return {
+            RecoveryStatus.RESTORED: (
+                "Restored", "The file was safely restored to the selected location.", "success"
+            ),
+            RecoveryStatus.RESTORED_WITH_WARNING: (
+                "Restored with warning",
+                "The file was restored, but current scanning still found suspicious evidence.",
+                "warning",
+            ),
+            RecoveryStatus.INTEGRITY_FAILED: (
+                "Restore blocked",
+                "Restore was blocked because the isolated file failed integrity verification.",
+                "error",
+            ),
+            RecoveryStatus.MISSING_QUARANTINE_OBJECT: (
+                "Restore unavailable",
+                "The isolated file is no longer available for restoration.",
+                "error",
+            ),
+            RecoveryStatus.DESTINATION_CONFLICT: (
+                "Choose another destination",
+                "A file already exists at that destination. AutoGuard did not overwrite it.",
+                "warning",
+            ),
+            RecoveryStatus.DANGEROUS_BLOCKED: (
+                "Restore blocked",
+                "Current detection still classifies this file as a confirmed threat, so AutoGuard did not restore it.",
+                "error",
+            ),
+            RecoveryStatus.FAILED: (
+                "Restore failed", "AutoGuard could not complete the restore operation.", "error"
+            ),
+        }.get(status, ("Restore finished", "The restore operation finished.", "info"))
 
     def restore_quarantine(self, quarantine_id: str, destination: str | Path | None = None) -> None:
-        self._submit(
-            f"restore:{quarantine_id}",
-            lambda: self.services.recovery.restore(quarantine_id, destination),
-            "recovery_completed",
-        )
+        def restore() -> dict[str, Any]:
+            result = self.services.recovery.restore(quarantine_id, destination)
+            title, default_message, tone = self._recovery_status_text(result.status)
+            message = result.warning or result.error or default_message
+            return {
+                "item_ref": quarantine_id,
+                "restored": bool(result.restored),
+                "title": title,
+                "message": message,
+                "tone": tone,
+                "restored_path": result.restored_path,
+            }
+        self._submit(f"restore:{quarantine_id}", restore, "recovery_completed")
 
     def delete_quarantine(self, quarantine_id: str) -> None:
-        self._submit(
-            f"delete-quarantine:{quarantine_id}",
-            lambda: self.services.quarantine.delete_quarantine_object(quarantine_id),
-            "quarantine_deleted",
-        )
+        def delete() -> dict[str, Any]:
+            deleted = bool(self.services.quarantine.delete_quarantine_object(quarantine_id))
+            return {
+                "item_ref": quarantine_id,
+                "deleted": deleted,
+                "title": "Removed from quarantine",
+                "message": (
+                    "The isolated file was permanently deleted. Audit history was retained."
+                    if deleted
+                    else "The isolated file could not be deleted."
+                ),
+            }
+        self._submit(f"delete-quarantine:{quarantine_id}", delete, "quarantine_deleted")
 
     def verify_incident_cleanup(self, incident_id: str) -> None:
         self._submit(
