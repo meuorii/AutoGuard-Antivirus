@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -1204,6 +1205,245 @@ class AutoGuardUIController:
             "can_restore": item.state is QuarantineState.QUARANTINED,
             "can_delete": item.state is QuarantineState.QUARANTINED,
         }
+
+    # ---------- Unified Activity read model ----------
+    _ACTIVITY_SCAN_LIMIT = 180
+    _ACTIVITY_INCIDENT_LIMIT = 120
+    _ACTIVITY_OUTPUT_LIMIT = 350
+
+    def load_activity(self) -> None:
+        """Load the unified user-facing activity feed off the UI thread."""
+        if "load-activity" in self.active_tasks():
+            return
+        self._submit("load-activity", self._activity_snapshot, "activity_data")
+
+    @staticmethod
+    def _activity_local_time(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return value.astimezone() if getattr(value, "tzinfo", None) else value
+        except Exception:
+            return None
+
+    @classmethod
+    def _activity_time_labels(cls, value: Any) -> tuple[str, str]:
+        local = cls._activity_local_time(value)
+        if local is None:
+            return "Earlier", "Time unavailable"
+        now = datetime.now().astimezone()
+        current_date = local.date()
+        if current_date == now.date():
+            section = "Today"
+        elif current_date == (now.date() - timedelta(days=1)):
+            section = "Yesterday"
+        else:
+            section = local.strftime("%b %d, %Y").replace(" 0", " ")
+        return section, local.strftime("%I:%M %p").lstrip("0")
+
+    def _activity_snapshot(self) -> list[dict[str, Any]]:
+        """Merge existing evidence into one chronological, sanitized feed.
+
+        No activity row is synthesized from an identifier or a current-state
+        snapshot alone. Scan rows come from persisted ScanHistory, threat rows
+        from persisted IncidentService events, and removable-drive detection
+        rows from the USB monitor's existing event history. AutoGuard currently
+        has no persisted timestamped protection-service transition history, so
+        such transitions are intentionally absent rather than invented.
+        """
+        events: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, int]] = set()
+
+        def add(
+            category: str,
+            title: str,
+            when: Any,
+            *,
+            detail: str = "",
+            tone: str = "info",
+        ) -> None:
+            local = self._activity_local_time(when)
+            if local is None:
+                return
+            try:
+                stamp = local.timestamp()
+            except Exception:
+                return
+            safe_detail = str(detail or "").strip()
+            key = (category, title, safe_detail.casefold(), int(stamp))
+            if key in seen:
+                return
+            seen.add(key)
+            events.append({
+                "category": category,
+                "title": title,
+                "detail": safe_detail,
+                "tone": tone,
+                "_sort_time": stamp,
+                "_when": local,
+            })
+
+        # Threat/quarantine/cleanup/recovery activity is already recorded in the
+        # incident timeline. Keep that service authoritative rather than reading
+        # incident tables from the presentation layer.
+        incidents = tuple(self.services.incidents.list_incidents(self._ACTIVITY_INCIDENT_LIMIT))
+        incident_shas = {incident.sha256 for incident in incidents}
+        meaningful_incident_events = {
+            IncidentEventType.FIRST_OBSERVED,
+            IncidentEventType.REPEATED_DETECTION,
+            IncidentEventType.QUARANTINE_SUCCEEDED,
+            IncidentEventType.QUARANTINE_FAILED,
+            IncidentEventType.QUARANTINE_INTEGRITY_FAILED,
+            IncidentEventType.MATCHING_COPY_FOUND,
+            IncidentEventType.MATCHING_COPY_QUARANTINED,
+            IncidentEventType.MATCHING_COPY_ALREADY_CONTAINED,
+            IncidentEventType.MATCHING_CLEANUP_FAILED,
+            IncidentEventType.CLEANUP_VERIFIED,
+            IncidentEventType.CLEANUP_VERIFICATION_PARTIAL,
+            IncidentEventType.CLEANUP_VERIFICATION_FAILED,
+            IncidentEventType.REAPPEARANCE,
+            IncidentEventType.RECOVERY_CONFLICT,
+            IncidentEventType.RECOVERY_BLOCKED,
+            IncidentEventType.RECOVERY_FAILED,
+            IncidentEventType.RECOVERY_SUCCEEDED,
+            IncidentEventType.STATUS_CHANGED,
+        }
+        for incident in incidents:
+            details = self.services.incidents.get_incident(incident.id)
+            if details is None:
+                continue
+            for event in details.events:
+                if event.event_type not in meaningful_incident_events:
+                    continue
+                if event.event_type is IncidentEventType.STATUS_CHANGED and getattr(event, "new_status", None) is IncidentStatus.OPEN:
+                    continue
+                friendly = self._timeline_row(event)
+                if event.event_type in (IncidentEventType.FIRST_OBSERVED, IncidentEventType.REPEATED_DETECTION):
+                    title = "Confirmed threat detected"
+                else:
+                    title = friendly["label"]
+                path = getattr(event, "path", None)
+                detail = str(path) if path else friendly["explanation"]
+                tone = "danger" if event.event_type in (
+                    IncidentEventType.FIRST_OBSERVED,
+                    IncidentEventType.REPEATED_DETECTION,
+                    IncidentEventType.REAPPEARANCE,
+                    IncidentEventType.QUARANTINE_FAILED,
+                    IncidentEventType.CLEANUP_VERIFICATION_FAILED,
+                    IncidentEventType.RECOVERY_FAILED,
+                ) else (
+                    "warning" if event.event_type in (
+                        IncidentEventType.CLEANUP_VERIFICATION_PARTIAL,
+                        IncidentEventType.RECOVERY_CONFLICT,
+                        IncidentEventType.RECOVERY_BLOCKED,
+                        IncidentEventType.QUARANTINE_INTEGRITY_FAILED,
+                        IncidentEventType.MATCHING_CLEANUP_FAILED,
+                    ) else "success"
+                )
+                add("Threats", title, event.occurred_at, detail=detail, tone=tone)
+
+        # Scan lifecycle and file-monitor evidence come from persisted scan
+        # history. Expensive per-session result reads are only performed when
+        # a real-time file event or recorded detection requires them.
+        history = self.services.scanner.history
+        sessions = tuple(history.recent_scans(self._ACTIVITY_SCAN_LIMIT))
+        for session in sessions:
+            if session.scan_type in (ScanType.MATCHING_COPY, ScanType.RECOVERY):
+                # Matching-copy and restore activity is represented by the
+                # incident timeline above using clearer user-facing events.
+                continue
+
+            counters = session.counters
+            needs_details = (
+                session.scan_type is ScanType.REAL_TIME
+                or int(counters.get("suspicious_detections", 0) or 0) > 0
+                or int(counters.get("dangerous_detections", 0) or 0) > 0
+            )
+            details = history.get_scan(session.id) if needs_details else None
+            detected = False
+            if details is not None:
+                for result in details.results:
+                    if result.detection_status is DetectionStatus.LOW_CONFIDENCE:
+                        detected = True
+                        add(
+                            "Threats", "Suspicious file detected", result.recorded_at,
+                            detail=result.path, tone="warning",
+                        )
+                    elif result.detection_status is DetectionStatus.HIGH_CONFIDENCE:
+                        detected = True
+                        # High-confidence detections normally create an incident.
+                        # Prefer its canonical FIRST_OBSERVED timeline entry and
+                        # only fall back to scan evidence if no incident exists.
+                        if not result.sha256 or result.sha256 not in incident_shas:
+                            add(
+                                "Threats", "Confirmed threat detected", result.recorded_at,
+                                detail=result.path, tone="danger",
+                            )
+
+            if session.scan_type is ScanType.REAL_TIME:
+                if not detected:
+                    add(
+                        "Scans", "File scanned",
+                        session.finished_at or session.started_at,
+                        detail=session.source_path, tone="success",
+                    )
+                continue
+
+            label = self._scan_label(session.scan_type)
+            source_detail = session.source_path
+            add("Scans", f"{label} started", session.started_at, detail=source_detail, tone="info")
+            if session.finished_at is not None:
+                status = getattr(session.status, "value", str(session.status)).upper()
+                checked = int(counters.get("scanned_files", 0) or 0)
+                file_word = "file" if checked == 1 else "files"
+                if status == "COMPLETED":
+                    title = f"{label} completed"
+                    tone = "success"
+                elif status == "INCOMPLETE":
+                    title = f"{label} stopped early"
+                    tone = "warning"
+                elif status == "FAILED":
+                    title = f"{label} could not finish"
+                    tone = "danger"
+                else:
+                    title = f"{label} finished"
+                    tone = "info"
+                detail = f"{checked:,} {file_word} checked"
+                if session.scan_type in (ScanType.MANUAL, ScanType.USB):
+                    detail += f" · {source_detail}"
+                add("Scans", title, session.finished_at, detail=detail, tone=tone)
+
+        # USBMonitor keeps an explicit runtime event history. Use only device
+        # presence events here; scan started/completed is already persisted as
+        # ScanHistory and would otherwise be duplicated.
+        usb_monitor = getattr(self.services, "usb_monitor", None)
+        if usb_monitor is not None and hasattr(usb_monitor, "recent_events"):
+            try:
+                usb_events = tuple(usb_monitor.recent_events())
+            except Exception:
+                usb_events = ()
+            for event in usb_events:
+                event_value = getattr(getattr(event, "event_type", None), "value", "")
+                if event_value == "USB_DETECTED":
+                    add(
+                        "Scans", "USB drive detected", getattr(event, "occurred_at", None),
+                        detail=getattr(event, "drive_root", ""), tone="info",
+                    )
+                elif event_value == "DEVICE_REMOVED":
+                    add(
+                        "Scans", "USB drive removed", getattr(event, "occurred_at", None),
+                        detail=getattr(event, "drive_root", ""), tone="info",
+                    )
+
+        events.sort(key=lambda item: item["_sort_time"], reverse=True)
+        result: list[dict[str, Any]] = []
+        for event in events[: self._ACTIVITY_OUTPUT_LIMIT]:
+            section, clock = self._activity_time_labels(event.pop("_when", None))
+            event.pop("_sort_time", None)
+            event["date_group"] = section
+            event["time"] = clock
+            result.append(event)
+        return result
 
     def load_history(self) -> None:
         self._submit(

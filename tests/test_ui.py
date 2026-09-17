@@ -1417,3 +1417,257 @@ def test_ux_refresh_phase9_delete_confirmation_is_user_facing_and_does_not_menti
     assert "Permanently delete isolated file" in page
     assert "file can no longer be restored from quarantine" in page
     assert ".agq" not in page
+
+
+def _phase10_activity_services():
+    from datetime import datetime, timedelta, timezone
+    from app.incidents import IncidentEventType, IncidentStatus
+    from app.models import DetectionStatus, ScanType
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def counters(*, scanned=0, suspicious=0, dangerous=0):
+        return {
+            "scanned_files": scanned,
+            "suspicious_detections": suspicious,
+            "dangerous_detections": dangerous,
+        }
+
+    quick = SimpleNamespace(
+        id="quick-session-internal",
+        scan_type=ScanType.QUICK,
+        source_path=r"c:\users\fonti\downloads",
+        started_at=now - timedelta(minutes=20),
+        finished_at=now - timedelta(minutes=19),
+        status=SimpleNamespace(value="COMPLETED"),
+        counters=counters(scanned=42),
+    )
+    realtime_clean = SimpleNamespace(
+        id="realtime-clean-internal",
+        scan_type=ScanType.REAL_TIME,
+        source_path=r"c:\users\fonti\downloads\recommendations.docx",
+        started_at=now - timedelta(minutes=12),
+        finished_at=now - timedelta(minutes=12) + timedelta(seconds=1),
+        status=SimpleNamespace(value="COMPLETED"),
+        counters=counters(scanned=1),
+    )
+    realtime_suspicious = SimpleNamespace(
+        id="realtime-suspicious-internal",
+        scan_type=ScanType.REAL_TIME,
+        source_path=r"c:\users\fonti\downloads\setup.exe",
+        started_at=now - timedelta(minutes=10),
+        finished_at=now - timedelta(minutes=10) + timedelta(seconds=1),
+        status=SimpleNamespace(value="COMPLETED"),
+        counters=counters(scanned=1, suspicious=1),
+    )
+    scheduled = SimpleNamespace(
+        id="scheduled-session-internal",
+        scan_type=ScanType.SCHEDULED,
+        source_path=r"c:\users\fonti\documents",
+        started_at=now - timedelta(days=1, minutes=8),
+        finished_at=now - timedelta(days=1, minutes=7),
+        status=SimpleNamespace(value="COMPLETED"),
+        counters=counters(scanned=18),
+    )
+
+    low_result = SimpleNamespace(
+        detection_status=DetectionStatus.LOW_CONFIDENCE,
+        recorded_at=now - timedelta(minutes=10) + timedelta(milliseconds=500),
+        path=r"c:\users\fonti\downloads\setup.exe",
+        sha256="a" * 64,
+    )
+    clean_result = SimpleNamespace(
+        detection_status=None,
+        recorded_at=now - timedelta(minutes=12) + timedelta(milliseconds=500),
+        path=realtime_clean.source_path,
+        sha256="b" * 64,
+    )
+
+    class History:
+        def recent_scans(self, limit):
+            return [realtime_suspicious, realtime_clean, quick, scheduled][:limit]
+
+        def get_scan(self, session_id):
+            if session_id == realtime_suspicious.id:
+                return SimpleNamespace(session=realtime_suspicious, results=(low_result,))
+            if session_id == realtime_clean.id:
+                return SimpleNamespace(session=realtime_clean, results=(clean_result,))
+            return None
+
+    incident = SimpleNamespace(
+        id="incident-internal-phase10",
+        sha256="c" * 64,
+        status=IncidentStatus.CONTAINED,
+        first_observed_path=r"c:\users\fonti\downloads\confirmed.bin",
+    )
+    events = (
+        SimpleNamespace(
+            id=1, event_type=IncidentEventType.FIRST_OBSERVED,
+            occurred_at=now - timedelta(minutes=8),
+            path=incident.first_observed_path, new_status=None, reappearance_count=None,
+        ),
+        SimpleNamespace(
+            id=2, event_type=IncidentEventType.QUARANTINE_SUCCEEDED,
+            occurred_at=now - timedelta(minutes=7),
+            path=incident.first_observed_path, new_status=None, reappearance_count=None,
+        ),
+        SimpleNamespace(
+            id=3, event_type=IncidentEventType.CLEANUP_VERIFIED,
+            occurred_at=now - timedelta(minutes=6),
+            path=None, new_status=None, reappearance_count=None,
+        ),
+        SimpleNamespace(
+            id=4, event_type=IncidentEventType.RECOVERY_SUCCEEDED,
+            occurred_at=now - timedelta(minutes=4),
+            path=r"c:\users\fonti\restored\confirmed.bin", new_status=None,
+            reappearance_count=None,
+        ),
+    )
+    details = SimpleNamespace(incident=incident, files=(), events=events)
+
+    class Incidents:
+        def list_incidents(self, limit):
+            return [incident][:limit]
+
+        def get_incident(self, incident_id):
+            return details if incident_id == incident.id else None
+
+    usb_event = SimpleNamespace(
+        event_type=SimpleNamespace(value="USB_DETECTED"),
+        occurred_at=now - timedelta(minutes=2),
+        drive_root="E:\\",
+        sequence=999,
+        session_id="usb-session-internal",
+    )
+
+    class USB:
+        def recent_events(self):
+            return (usb_event,)
+
+    services = SimpleNamespace(
+        scanner=SimpleNamespace(history=History()),
+        incidents=Incidents(),
+        usb_monitor=USB(),
+    )
+    return services, incident
+
+
+def test_ux_refresh_phase10_activity_merges_real_recorded_sources_with_friendly_events():
+    services, incident = _phase10_activity_services()
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        feed = controller._activity_snapshot()
+    finally:
+        controller.shutdown()
+
+    titles = [event["title"] for event in feed]
+    for expected in (
+        "Quick Scan started",
+        "Quick Scan completed",
+        "Scheduled scan started",
+        "Scheduled scan completed",
+        "File scanned",
+        "Suspicious file detected",
+        "Confirmed threat detected",
+        "File quarantined",
+        "Cleanup verified",
+        "File restored",
+        "USB drive detected",
+    ):
+        assert expected in titles
+
+    rendered = str(feed)
+    assert incident.id not in rendered
+    assert incident.sha256 not in rendered
+    assert "FIRST_OBSERVED" not in rendered
+    assert "LOW_CONFIDENCE" not in rendered
+    assert all(event["category"] in {"Scans", "Threats", "Protection"} for event in feed)
+    assert all("time" in event and "date_group" in event for event in feed)
+
+
+def test_ux_refresh_phase10_high_confidence_scan_does_not_duplicate_canonical_incident_detection():
+    from datetime import datetime, timezone
+    from app.incidents import IncidentEventType, IncidentStatus
+    from app.models import DetectionStatus, ScanType
+
+    now = datetime.now(timezone.utc)
+    sha = "d" * 64
+    session = SimpleNamespace(
+        id="high-session-internal", scan_type=ScanType.REAL_TIME,
+        source_path=r"c:\users\fonti\downloads\confirmed.exe",
+        started_at=now, finished_at=now,
+        status=SimpleNamespace(value="COMPLETED"),
+        counters={"scanned_files": 1, "suspicious_detections": 0, "dangerous_detections": 1},
+    )
+    stored = SimpleNamespace(
+        detection_status=DetectionStatus.HIGH_CONFIDENCE,
+        recorded_at=now, path=session.source_path, sha256=sha,
+    )
+    incident = SimpleNamespace(
+        id="hidden-incident", sha256=sha, status=IncidentStatus.OPEN,
+        first_observed_path=session.source_path,
+    )
+    event = SimpleNamespace(
+        id=1, event_type=IncidentEventType.FIRST_OBSERVED,
+        occurred_at=now, path=session.source_path, new_status=None, reappearance_count=None,
+    )
+
+    history = SimpleNamespace(
+        recent_scans=lambda limit: [session],
+        get_scan=lambda session_id: SimpleNamespace(session=session, results=(stored,)),
+    )
+    incidents = SimpleNamespace(
+        list_incidents=lambda limit: [incident],
+        get_incident=lambda incident_id: SimpleNamespace(incident=incident, files=(), events=(event,)),
+    )
+    services = SimpleNamespace(
+        scanner=SimpleNamespace(history=history), incidents=incidents, usb_monitor=None,
+    )
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        feed = controller._activity_snapshot()
+    finally:
+        controller.shutdown()
+
+    assert [event["title"] for event in feed].count("Confirmed threat detected") == 1
+
+
+def test_ux_refresh_phase10_activity_page_has_required_filters_states_and_hides_raw_backend_terms():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "app/ui/activity_page.py").read_text(encoding="utf-8")
+    controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
+
+    assert '("All", "Scans", "Threats", "Protection")' in page
+    assert "Loading activity" in page
+    assert "No activity has been recorded yet" in page
+    assert "No recorded protection changes" in page
+    assert 'section = "Today"' in controller
+    assert 'section = "Yesterday"' in controller
+    for raw in (
+        "scan_session_id", "incident_id", "sha256", "FIRST_OBSERVED",
+        "LOW_CONFIDENCE", "HIGH_CONFIDENCE", "worker",
+    ):
+        assert raw not in page
+
+
+def test_ux_refresh_phase10_activity_loading_runs_off_ui_thread_and_uses_existing_services():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app/ui/controller.py").read_text(encoding="utf-8")
+    assert 'self._submit("load-activity", self._activity_snapshot, "activity_data")' in source
+    assert "self.services.scanner.history" in source
+    assert "self.services.incidents.list_incidents" in source
+    assert "usb_monitor.recent_events()" in source
+
+
+def test_ux_refresh_phase10_does_not_invent_protection_state_change_events_without_recorded_source():
+    history = SimpleNamespace(recent_scans=lambda limit: [])
+    incidents = SimpleNamespace(list_incidents=lambda limit: [], get_incident=lambda incident_id: None)
+    services = SimpleNamespace(
+        scanner=SimpleNamespace(history=history), incidents=incidents, usb_monitor=None,
+    )
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        feed = controller._activity_snapshot()
+    finally:
+        controller.shutdown()
+    assert feed == []
