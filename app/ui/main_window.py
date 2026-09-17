@@ -41,6 +41,29 @@ if tuple(PAGE_CLASSES) != tuple(key for key, _ in NAV_ITEMS):
     raise RuntimeError("Sidebar navigation and page registry are out of sync.")
 
 
+# Central cross-page synchronization. These are presentation invalidations only;
+# they never construct/restart backend services. Hidden pages refresh on next show.
+STATE_CHANGE_TARGETS = {
+    "scan_started": {"home", "scan"},
+    "scan_stopped": {"home", "scan", "activity"},
+    "scan_completed": {"home", "scan", "threats", "quarantine", "activity"},
+    "scan_batch_completed": {"home", "scan", "threats", "quarantine", "activity"},
+    "scan_result_ready": {"home", "scan", "threats", "quarantine", "activity"},
+    "incident_verified": {"home", "threats", "activity"},
+    "quarantine_verified": {"quarantine"},
+    "quarantine_deleted": {"home", "threats", "quarantine", "activity"},
+    "recovery_completed": {"home", "threats", "quarantine", "activity"},
+    "settings_applied": {"home", "settings"},
+}
+PASSIVE_REFRESH_PAGES = {"home", "threats", "quarantine", "activity", "settings"}
+GLOBAL_STATUS_EVENTS = {
+    "scan_started", "scan_stopped", "scan_completed", "scan_batch_completed",
+    "scan_result_ready", "incident_verified", "quarantine_deleted",
+    "recovery_completed", "settings_applied",
+}
+PASSIVE_REFRESH_MS = 3000
+
+
 class MainWindow(ctk.CTk):
     """Responsive shell with one centrally managed active-page state."""
 
@@ -80,7 +103,7 @@ class MainWindow(ctk.CTk):
 
         self.show_page(DEFAULT_PAGE)
         self.after(90, self._drain_messages)
-        self.after(700, self._periodic_home_refresh)
+        self.after(700, self._periodic_visible_refresh)
         if initial_path is not None:
             self.after(450, lambda: self.controller.start_scan(initial_path))
 
@@ -150,18 +173,43 @@ class MainWindow(ctk.CTk):
                     result.get("message", "The isolated file was permanently deleted."),
                     "warning",
                 )
-            elif message.kind == "settings_applied":
-                # Keep the global sidebar/Home protection summary synchronized
-                # after an existing runtime service is started or stopped.
+            # Home/sidebar status is global, so keep that lightweight snapshot
+            # synchronized even while another page is visible.
+            if message.kind in GLOBAL_STATUS_EVENTS:
                 self.controller.refresh_dashboard()
+
+            # Refresh only the currently visible affected heavy page. Hidden
+            # pages use their normal on_show load when selected.
+            targets = STATE_CHANGE_TARGETS.get(message.kind, set())
+            if self._active_page in targets:
+                self._refresh_visible_page(message.kind)
         self.after(90, self._drain_messages)
 
-    def _periodic_home_refresh(self) -> None:
+    def _refresh_visible_page(self, reason: str = "state-sync") -> None:
+        page = self.pages.get(self._active_page or "")
+        if page is None:
+            return
+        try:
+            page.refresh_from_state(reason)
+        except Exception:
+            # A presentation refresh must never interrupt the global message pump.
+            pass
+
+    def _periodic_visible_refresh(self) -> None:
+        """Keep the visible read-only page current with background monitor data.
+
+        File/USB monitoring can persist evidence without going through the UI bus.
+        Only the visible data page is refreshed, and controller read tasks are
+        de-duplicated so this never creates parallel service/database readers.
+        """
         if self._closing:
             return
-        if self._active_page == "home":
-            self.controller.refresh_dashboard()
-        self.after(2500, self._periodic_home_refresh)
+        # Background file/USB activity may bypass the UI message bus. Keep the
+        # global Home/sidebar health snapshot current regardless of active page.
+        self.controller.refresh_dashboard()
+        if self._active_page in PASSIVE_REFRESH_PAGES and self._active_page != "home":
+            self._refresh_visible_page("background-sync")
+        self.after(PASSIVE_REFRESH_MS, self._periodic_visible_refresh)
 
     def _close(self) -> None:
         self._closing = True

@@ -9,6 +9,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
+from app.ui.components import SectionHeader, StateCard, StatusBadge
 from app.ui.threat_details_page import ThreatDetailsView
 
 
@@ -32,6 +33,8 @@ class ThreatsPage(BasePage):
         super().__init__(master, controller, **kwargs)
         self._loading = False
         self._detail_ref = None
+        self._detail_data: dict | None = None
+        self._list_data: tuple[dict, ...] = ()
         self._render_loading()
 
     def on_show(self) -> None:
@@ -46,6 +49,12 @@ class ThreatsPage(BasePage):
         self._render_loading()
         self.controller.load_threats()
 
+    def refresh_from_state(self, reason: str = "") -> None:
+        if self._detail_ref:
+            self.controller.load_threat_details(self._detail_ref)
+        else:
+            self.controller.load_threats()
+
     def handle_message(self, message) -> None:
         if message.kind == "threat_details_requested":
             self._detail_ref = message.payload.get("threat_ref")
@@ -53,16 +62,23 @@ class ThreatsPage(BasePage):
                 self._render_details_loading()
         elif message.kind == "threat_details_data":
             if self._detail_ref:
+                result = dict(message.payload.get("result", {}))
                 self._loading = False
-                self._render_details(message.payload.get("result", {}))
+                if result != self._detail_data:
+                    self._detail_data = result
+                    self._render_details(result)
         elif message.kind == "threat_details_closed":
             self._detail_ref = None
+            self._detail_data = None
             self._loading = True
             self._render_loading()
             self.controller.load_threats()
         elif message.kind == "threats_data" and not self._detail_ref:
+            rows = tuple(message.payload.get("result", ()))
             self._loading = False
-            self._render(message.payload.get("result", ()))
+            if rows != self._list_data:
+                self._list_data = rows
+                self._render(rows)
         elif message.kind in {"incident_verified", "quarantine_deleted", "recovery_completed"}:
             if self._detail_ref:
                 self.controller.load_threat_details(self._detail_ref)
@@ -73,12 +89,9 @@ class ThreatsPage(BasePage):
     def _render_details_loading(self) -> None:
         self.clear_body()
         self.body.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            self.body,
-            text="Loading threat details…",
-            font=(theme.FONT, 11),
-            text_color=theme.TEXT_MUTED,
-        ).grid(row=0, column=0, padx=12, pady=28, sticky="w")
+        StateCard(self.body, "Loading threat details…", "AutoGuard is reading the recorded threat evidence.").grid(
+            row=0, column=0, padx=8, pady=8, sticky="ew"
+        )
 
     def _render_details(self, data) -> None:
         self.clear_body()
@@ -92,12 +105,9 @@ class ThreatsPage(BasePage):
     def _render_loading(self) -> None:
         self.clear_body()
         self.body.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            self.body,
-            text="Loading threats…",
-            font=(theme.FONT, 11),
-            text_color=theme.TEXT_MUTED,
-        ).grid(row=0, column=0, padx=12, pady=28, sticky="w")
+        StateCard(self.body, "Loading threats…", "AutoGuard is reading recorded threat activity.").grid(
+            row=0, column=0, padx=8, pady=8, sticky="ew"
+        )
 
     def _render(self, rows) -> None:
         self.clear_body()
@@ -123,31 +133,11 @@ class ThreatsPage(BasePage):
             self._no_history(next_row)
 
     def _empty_attention(self, row: int) -> None:
-        frame = ctk.CTkFrame(
+        StateCard(
             self.body,
-            fg_color=theme.SURFACE,
-            border_width=1,
-            border_color=theme.BORDER,
-            corner_radius=theme.RADIUS,
-        )
-        frame.grid(row=row, column=0, padx=8, pady=(4, 12), sticky="ew")
-        frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            frame,
-            text="No active threats",
-            font=(theme.FONT, 15, "bold"),
-            text_color=theme.TEXT,
-            anchor="w",
-        ).grid(row=0, column=0, padx=16, pady=(14, 3), sticky="ew")
-        ctk.CTkLabel(
-            frame,
-            text="Nothing currently needs your review. AutoGuard will continue monitoring supported locations.",
-            font=(theme.FONT, 10),
-            text_color=theme.TEXT_MUTED,
-            anchor="w",
-            justify="left",
-            wraplength=760,
-        ).grid(row=1, column=0, padx=16, pady=(0, 14), sticky="ew")
+            "No active threats",
+            "Nothing currently needs your review. AutoGuard will continue monitoring supported locations.",
+        ).grid(row=row, column=0, padx=8, pady=(4, 12), sticky="ew")
 
     def _no_history(self, row: int) -> None:
         ctk.CTkLabel(
@@ -159,26 +149,9 @@ class ThreatsPage(BasePage):
         ).grid(row=row, column=0, padx=12, pady=(0, 18), sticky="w")
 
     def _render_section(self, row: int, title: str, items) -> int:
-        header = ctk.CTkFrame(self.body, fg_color="transparent")
-        header.grid(row=row, column=0, padx=8, pady=(12, 5), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            header,
-            text=title,
-            font=(theme.FONT, 14, "bold"),
-            text_color=theme.TEXT,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            header,
-            text=str(len(items)),
-            font=(theme.FONT, 10, "bold"),
-            text_color=theme.TEXT_MUTED,
-            fg_color=theme.SURFACE_ALT,
-            corner_radius=6,
-            padx=8,
-            pady=2,
-        ).grid(row=0, column=1, sticky="e")
+        SectionHeader(self.body, title, count=len(items)).grid(
+            row=row, column=0, padx=8, pady=(12, 5), sticky="ew"
+        )
         row += 1
         for item in items:
             self._threat_card(row, item)
@@ -206,18 +179,10 @@ class ThreatsPage(BasePage):
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew")
-        color, background = _STATUS_STYLE.get(
-            item.get("status_key"), (theme.TEXT_MUTED, theme.SURFACE_ALT)
-        )
-        ctk.CTkLabel(
+        StatusBadge(
             top,
-            text=item.get("status", "Needs attention"),
-            font=(theme.FONT, 9, "bold"),
-            text_color=color,
-            fg_color=background,
-            corner_radius=6,
-            padx=8,
-            pady=3,
+            item.get("status", "Needs attention"),
+            item.get("status_key", "idle"),
         ).grid(row=0, column=1, padx=(10, 0), sticky="e")
 
         ctk.CTkLabel(

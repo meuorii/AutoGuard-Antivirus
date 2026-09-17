@@ -5,7 +5,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
-from app.ui.components import ConfirmDialog, RestoreDialog
+from app.ui.components import ConfirmDialog, RestoreDialog, StateCard, StatusBadge
 from app.ui.quarantine_details_page import QuarantineDetailsView
 
 
@@ -27,6 +27,7 @@ class QuarantinePage(BasePage):
         super().__init__(master, controller, **kwargs)
         self._detail_ref: str | None = None
         self._detail_data: dict | None = None
+        self._list_data: dict | None = None
         self._notice: dict | None = None
 
     def on_show(self):
@@ -39,10 +40,16 @@ class QuarantinePage(BasePage):
             self._show_loading("Loading quarantine…")
             self.controller.load_quarantine()
 
+    def refresh_from_state(self, reason: str = "") -> None:
+        self._refresh_current()
+
     def handle_message(self, message):
         kind = message.kind
         if kind == "quarantine_data" and self._detail_ref is None:
-            self._render_list(message.payload.get("result", {}))
+            result = dict(message.payload.get("result", {}))
+            if result != self._list_data:
+                self._list_data = result
+                self._render_list(result)
         elif kind == "quarantine_details_requested":
             self._detail_ref = message.payload.get("item_ref")
             self._detail_data = None
@@ -51,8 +58,9 @@ class QuarantinePage(BasePage):
         elif kind == "quarantine_details_data":
             result = message.payload.get("result", {})
             if self._detail_ref and result.get("item_ref") == self._detail_ref:
-                self._detail_data = result
-                self._render_details(result)
+                if result != self._detail_data:
+                    self._detail_data = result
+                    self._render_details(result)
         elif kind == "quarantine_details_closed":
             self._detail_ref = None
             self._detail_data = None
@@ -123,18 +131,16 @@ class QuarantinePage(BasePage):
     def _show_loading(self, text: str):
         self.clear_body()
         self.body.grid_columnconfigure(0, weight=1)
-        frame = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
-        frame.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
-        ctk.CTkLabel(frame, text=text, font=(theme.FONT, 12, "bold"), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=18, pady=(18, 4), sticky="w")
-        ctk.CTkLabel(frame, text="This may take a moment.", font=(theme.FONT, 10), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=18, pady=(0, 18), sticky="w")
+        StateCard(self.body, text, "This may take a moment.").grid(
+            row=0, column=0, padx=8, pady=8, sticky="ew"
+        )
 
     def _render_error(self, message: str):
         self.clear_body()
         self.body.grid_columnconfigure(0, weight=1)
-        frame = ctk.CTkFrame(self.body, fg_color=theme.DANGER_DARK, border_width=1, border_color=theme.DANGER, corner_radius=theme.RADIUS)
-        frame.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
-        ctk.CTkLabel(frame, text="Could not load quarantine", font=(theme.FONT, 13, "bold"), text_color=theme.DANGER, anchor="w").grid(row=0, column=0, padx=18, pady=(16, 3), sticky="ew")
-        ctk.CTkLabel(frame, text=message, font=(theme.FONT, 10), text_color=theme.TEXT, anchor="w", justify="left", wraplength=780).grid(row=1, column=0, padx=18, pady=(0, 16), sticky="ew")
+        StateCard(self.body, "Could not load quarantine", message, tone="danger").grid(
+            row=0, column=0, padx=8, pady=8, sticky="ew"
+        )
 
     def _notice_widget(self, parent, row: int):
         if not self._notice:
@@ -196,8 +202,9 @@ class QuarantinePage(BasePage):
             ctk.CTkLabel(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=(theme.FONT, 9), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=16, sticky="ew")
             ctk.CTkLabel(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=(theme.FONT, 9), text_color=theme.TEXT_DIM, anchor="w", justify="left", wraplength=650).grid(row=2, column=0, padx=16, pady=(2, 12), sticky="ew")
 
-            color, background = _STATUS_STYLE.get(item.get("threat_status_key"), (theme.TEXT_MUTED, theme.SURFACE_ALT))
-            ctk.CTkLabel(card, text=item.get("threat_status", "Threat recorded"), font=(theme.FONT, 8, "bold"), text_color=color, fg_color=background, corner_radius=6, padx=8, pady=3).grid(row=0, column=1, padx=(8, 16), pady=(14, 2), sticky="e")
+            StatusBadge(
+                card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")
+            ).grid(row=0, column=1, padx=(8, 16), pady=(14, 2), sticky="e")
             actions = ctk.CTkFrame(card, fg_color="transparent")
             actions.grid(row=1, column=1, rowspan=2, padx=13, pady=(4, 12), sticky="e")
             ref = item.get("item_ref")

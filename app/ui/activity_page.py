@@ -5,6 +5,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
+from app.ui.components import StateCard
 
 
 _FILTERS = ("All", "Scans", "Threats", "Protection")
@@ -32,9 +33,12 @@ class ActivityPage(BasePage):
 
     def handle_message(self, message) -> None:
         if message.kind == "activity_data":
+            events = list(message.payload.get("result", ()))
+            was_loading = self._loading
             self._loading = False
-            self._events = list(message.payload.get("result", ()))
-            self._render()
+            if was_loading or events != self._events:
+                self._events = events
+                self._render()
         elif message.kind == "task_failed" and message.payload.get("task") == "load-activity":
             self._loading = False
             self._render(error=message.payload.get("error", "Activity could not be loaded."))
@@ -49,6 +53,11 @@ class ActivityPage(BasePage):
     def refresh(self) -> None:
         self._loading = True
         self._render()
+        self.controller.load_activity()
+
+    def refresh_from_state(self, reason: str = "") -> None:
+        # Passive/event synchronization keeps the current feed visible while an
+        # off-thread read model refreshes; no loading flash on every update.
         self.controller.load_activity()
 
     def _set_filter(self, value: str) -> None:
@@ -149,31 +158,9 @@ class ActivityPage(BasePage):
             row_index += 1
 
     def _state_card(self, title: str, message: str, *, tone: str = "info") -> None:
-        card = ctk.CTkFrame(
-            self.body,
-            fg_color=theme.SURFACE,
-            border_width=1,
-            border_color=theme.BORDER,
-            corner_radius=theme.RADIUS,
+        StateCard(self.body, title, message, tone=tone).grid(
+            row=1, column=0, padx=8, pady=4, sticky="ew"
         )
-        card.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            card,
-            text=title,
-            font=(theme.FONT, 14, "bold"),
-            text_color=_TONE_COLORS.get(tone, theme.TEXT),
-            anchor="w",
-        ).grid(row=0, column=0, padx=16, pady=(14, 3), sticky="ew")
-        ctk.CTkLabel(
-            card,
-            text=message,
-            font=(theme.FONT, 10),
-            text_color=theme.TEXT_MUTED,
-            justify="left",
-            anchor="w",
-            wraplength=800,
-        ).grid(row=1, column=0, padx=16, pady=(0, 14), sticky="ew")
 
     def _activity_row(self, row: int, event: dict) -> None:
         card = ctk.CTkFrame(

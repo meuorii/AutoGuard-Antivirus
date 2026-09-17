@@ -9,6 +9,7 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from app.ui import theme
+from app.ui.components import StatusBadge
 
 
 _STATUS_STYLE = {
@@ -68,19 +69,10 @@ class ThreatDetailsView(ctk.CTkFrame):
             anchor="w",
         ).grid(row=0, column=0, padx=(18, 10), pady=(17, 4), sticky="ew")
 
-        status_key = self._data.get("status_key")
-        color, background = _STATUS_STYLE.get(
-            status_key, (theme.TEXT_MUTED, theme.SURFACE_ALT)
-        )
-        ctk.CTkLabel(
+        StatusBadge(
             header,
-            text=self._data.get("status", "Needs attention"),
-            font=(theme.FONT, 10, "bold"),
-            text_color=color,
-            fg_color=background,
-            corner_radius=6,
-            padx=9,
-            pady=4,
+            self._data.get("status", "Needs attention"),
+            self._data.get("status_key", "attention"),
         ).grid(row=0, column=1, padx=(0, 18), pady=(17, 4), sticky="e")
 
         ctk.CTkLabel(
@@ -322,7 +314,7 @@ class ThreatDetailsView(ctk.CTkFrame):
             body.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(
                 body,
-                text=item.get("label", "Threat activity recorded"),
+                text=("Threat resolved" if item.get("label") == "Incident resolved" else item.get("label", "Threat activity recorded")),
                 font=(theme.FONT, 10, "bold"),
                 text_color=theme.TEXT,
                 anchor="w",

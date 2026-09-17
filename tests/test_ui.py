@@ -1851,3 +1851,97 @@ def test_ux_refresh_phase11_unavailable_service_is_not_emulated_with_ui_state(tm
         assert "unavailable for this launch" in failed.payload["error"].lower()
     finally:
         controller.shutdown()
+
+
+def test_ux_refresh_phase12_navigation_registry_remains_single_six_page_source_of_truth():
+    root = Path(__file__).resolve().parents[1]
+    sidebar = (root / "app/ui/sidebar.py").read_text(encoding="utf-8")
+    window = (root / "app/ui/main_window.py").read_text(encoding="utf-8")
+
+    assert '("home", "Home")' in sidebar
+    assert '("scan", "Scan")' in sidebar
+    assert '("threats", "Threats")' in sidebar
+    assert '("quarantine", "Quarantine")' in sidebar
+    assert '("activity", "Activity")' in sidebar
+    assert '("settings", "Settings")' in sidebar
+    assert 'if tuple(PAGE_CLASSES) != tuple(key for key, _ in NAV_ITEMS)' in window
+    assert 'page.tkraise()' in window
+    assert 'page.on_show()' in window
+    # Navigation raises persistent page instances; it does not create services.
+    show_page = window[window.index("    def show_page"):window.index("    def _drain_messages")]
+    for forbidden in ("Scanner(", "IncidentService(", "QuarantineService(", "Database(", ".start()"):
+        assert forbidden not in show_page
+
+
+def test_ux_refresh_phase12_cross_page_state_changes_have_central_refresh_targets():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app/ui/main_window.py").read_text(encoding="utf-8")
+
+    for event in (
+        "scan_started", "scan_completed", "scan_result_ready", "incident_verified",
+        "quarantine_deleted", "recovery_completed", "settings_applied",
+    ):
+        assert f'"{event}"' in source
+    assert "STATE_CHANGE_TARGETS" in source
+    assert "GLOBAL_STATUS_EVENTS" in source
+    assert "PASSIVE_REFRESH_PAGES" in source
+    assert "self.controller.refresh_dashboard()" in source
+    assert 'self._refresh_visible_page("background-sync")' in source
+
+
+def test_ux_refresh_phase12_scan_state_messages_reach_hidden_scan_page_without_recreating_it():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app/ui/main_window.py").read_text(encoding="utf-8")
+    scan_page = (root / "app/ui/scan_page.py").read_text(encoding="utf-8")
+
+    # Every persistent page receives bus messages even when it is not raised.
+    assert "for page in self.pages.values():" in source
+    assert "page.handle_message(message)" in source
+    for event in ("scan_started", "scan_discovered", "scan_result", "scan_stopped", "scan_result_ready"):
+        assert f'message.kind == "{event}"' in scan_page or f'message.kind in ("{event}"' in scan_page
+    assert "def refresh_from_state" in scan_page
+    assert "No service/database reload needed" in scan_page
+
+
+def test_ux_refresh_phase12_read_refreshes_are_deduplicated():
+    controller_source = (
+        Path(__file__).resolve().parents[1] / "app/ui/controller.py"
+    ).read_text(encoding="utf-8")
+    assert "def _submit_once" in controller_source
+    for task in ("refresh-dashboard", "load-threats", "load-quarantine", "load-settings"):
+        assert f'self._submit_once("{task}"' in controller_source
+    # Activity keeps its pre-existing explicit in-flight guard.
+    assert 'if "load-activity" in self.active_tasks()' in controller_source
+
+
+def test_ux_refresh_phase12_shared_components_are_reused_across_refreshed_pages():
+    root = Path(__file__).resolve().parents[1]
+    common = (root / "app/ui/components/common.py").read_text(encoding="utf-8")
+    threats = (root / "app/ui/threats_page.py").read_text(encoding="utf-8")
+    quarantine = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
+    activity = (root / "app/ui/activity_page.py").read_text(encoding="utf-8")
+    details = (root / "app/ui/threat_details_page.py").read_text(encoding="utf-8")
+
+    for component in ("StatusBadge", "StateCard", "SectionHeader", "ExpandableDetails"):
+        assert f"class {component}" in common
+    assert "StatusBadge(" in threats and "SectionHeader(" in threats and "StateCard(" in threats
+    assert "StatusBadge(" in quarantine and "StateCard(" in quarantine
+    assert "StateCard(" in activity
+    assert "StatusBadge(" in details
+
+
+def test_ux_refresh_phase12_user_facing_terminology_is_consistent():
+    root = Path(__file__).resolve().parents[1]
+    sidebar = (root / "app/ui/sidebar.py").read_text(encoding="utf-8")
+    dashboard = (root / "app/ui/dashboard.py").read_text(encoding="utf-8")
+    scan = (root / "app/ui/scan_page.py").read_text(encoding="utf-8")
+    active_scan = (root / "app/ui/components/active_scan.py").read_text(encoding="utf-8")
+    threat_details = (root / "app/ui/threat_details_page.py").read_text(encoding="utf-8")
+
+    assert 'title = "Home"' in dashboard
+    assert 'title="Quick Scan"' in scan and 'title="Full Scan"' in scan and 'title="Custom Scan"' in scan
+    assert 'text="Files checked"' in active_scan
+    assert '("manual", "Manual Scan")' not in scan
+    assert '"Threat resolved" if item.get("label") == "Incident resolved"' in threat_details
+    for legacy in ('("incidents",', '("threat_trail",', '("history",'):
+        assert legacy not in sidebar

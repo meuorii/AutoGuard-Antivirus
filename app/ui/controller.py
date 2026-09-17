@@ -81,13 +81,26 @@ class AutoGuardUIController:
 
         self._executor.submit(runner)
 
+    def _submit_once(self, task_name: str, operation: Callable[[], Any], success_kind: str) -> bool:
+        """Submit an idempotent read/refresh task only when it is not already running.
+
+        This prevents navigation, periodic visible-page synchronization, and a
+        backend event from queueing duplicate SQLite/service reads for the same
+        page. Mutating operations continue to use ``_submit`` directly.
+        """
+        with self._lock:
+            if task_name in self._active_tasks:
+                return False
+        self._submit(task_name, operation, success_kind)
+        return True
+
     # ---------- Home / read models ----------
     def navigate_to(self, page: str) -> None:
         """Request a presentation-only page change through the UI message bus."""
         self.bus.publish("navigate", page=page)
 
     def refresh_dashboard(self) -> None:
-        self._submit("refresh-dashboard", self._dashboard_snapshot, "dashboard_data")
+        self._submit_once("refresh-dashboard", self._dashboard_snapshot, "dashboard_data")
 
     @staticmethod
     def _health_running(health: Any | None) -> bool:
@@ -494,7 +507,7 @@ class AutoGuardUIController:
             return "Time unavailable"
 
     def load_threats(self) -> None:
-        self._submit("load-threats", self._threat_rows, "threats_data")
+        self._submit_once("load-threats", self._threat_rows, "threats_data")
 
     def _threat_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -564,7 +577,7 @@ class AutoGuardUIController:
         ref = str(threat_ref or self._selected_threat_ref or "").strip()
         if not ref:
             return
-        self._submit(
+        self._submit_once(
             f"load-threat-details:{ref}",
             lambda: self._threat_details_snapshot(ref),
             "threat_details_data",
@@ -1088,7 +1101,7 @@ class AutoGuardUIController:
         return f"{size:.1f} {unit}"
 
     def load_quarantine(self) -> None:
-        self._submit("load-quarantine", self._quarantine_snapshot, "quarantine_data")
+        self._submit_once("load-quarantine", self._quarantine_snapshot, "quarantine_data")
 
     def _quarantine_snapshot(self) -> dict[str, Any]:
         """Return only user-facing list data for currently isolated files."""
@@ -1141,7 +1154,7 @@ class AutoGuardUIController:
         ref = str(item_ref or self._selected_quarantine_ref or "").strip()
         if not ref:
             return
-        self._submit(
+        self._submit_once(
             f"load-quarantine-details:{ref}",
             lambda: self._quarantine_details_snapshot(ref),
             "quarantine_details_data",
@@ -1677,7 +1690,7 @@ class AutoGuardUIController:
     # ---------- Settings/status ----------
     def load_settings(self) -> None:
         """Load the current runtime/configuration state off the UI thread."""
-        self._submit("load-settings", self.settings_snapshot, "settings_data")
+        self._submit_once("load-settings", self.settings_snapshot, "settings_data")
 
     @staticmethod
     def _service_state(service: Any | None) -> dict[str, Any]:

@@ -29,12 +29,19 @@ class SettingsPage(BasePage):
     def on_show(self) -> None:
         self.refresh()
 
+    def refresh_from_state(self, reason: str = "") -> None:
+        self.controller.load_settings()
+
     def handle_message(self, message) -> None:
         if message.kind == "settings_data":
-            self._data = dict(message.payload.get("result", {}))
+            result = dict(message.payload.get("result", {}))
+            was_loading = self._loading
+            changed = result != self._data
+            self._data = result
             self._loading = False
             self._error = None
-            self._render()
+            if was_loading or changed:
+                self._render()
         elif message.kind == "settings_applied":
             result = message.payload.get("result", {})
             self._feedback = (
