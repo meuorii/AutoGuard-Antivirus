@@ -1675,16 +1675,164 @@ class AutoGuardUIController:
         )
 
     # ---------- Settings/status ----------
+    def load_settings(self) -> None:
+        """Load the current runtime/configuration state off the UI thread."""
+        self._submit("load-settings", self.settings_snapshot, "settings_data")
+
+    @staticmethod
+    def _service_state(service: Any | None) -> dict[str, Any]:
+        if service is None:
+            return {
+                "available": False,
+                "running": False,
+                "status": "Unavailable for this launch",
+                "detail": "This protection service was not created by the current startup configuration.",
+            }
+        health = service.health()
+        running = bool(getattr(health, "running", False))
+        raw_status = getattr(getattr(health, "status", None), "value", None)
+        if raw_status is None:
+            status = "On" if running else "Off"
+        else:
+            status = {
+                "RUNNING": "On",
+                "STOPPED": "Off",
+                "DEGRADED": "Needs attention",
+            }.get(str(raw_status).upper(), "On" if running else "Off")
+        detail = getattr(health, "last_error", None) or (
+            "Protection is active." if running else "Protection is currently stopped."
+        )
+        return {"available": True, "running": running, "status": status, "detail": detail}
+
     def settings_snapshot(self) -> dict[str, Any]:
-        return {
-            "database": str(self.services.config.database_path),
-            "quarantine": str(self.services.config.quarantine_dir),
-            "max_file_size_bytes": self.services.config.max_file_size_bytes,
-            "monitor_paths": tuple(str(p) for p in (
-                self.services.file_monitor.monitored_paths() if self.services.file_monitor else ()
-            )),
-            "quick_hours": self.services.scheduler.settings.quick_interval_hours,
-            "full_days": self.services.scheduler.settings.full_interval_days,
-            "file_monitor_enabled": self.services.file_monitor is not None,
-            "usb_monitor_enabled": self.services.usb_monitor is not None,
+        """Return a read model backed only by real configuration/service state."""
+        file_monitor = self.services.file_monitor
+        usb_monitor = self.services.usb_monitor
+        scheduler = self.services.scheduler
+        scheduler_health = scheduler.health()
+
+        monitor_paths = tuple(
+            str(path) for path in (
+                file_monitor.monitored_paths()
+                if file_monitor is not None
+                else getattr(scheduler, "quick_paths", ())
+            )
+        )
+        max_bytes = int(getattr(self.services.scanner, "max_file_size_bytes", self.services.config.max_file_size_bytes))
+
+        startup_dispatch = getattr(self.services, "startup_dispatch", None)
+        startup_accepted = bool(getattr(startup_dispatch, "accepted", False)) if startup_dispatch is not None else False
+        if startup_dispatch is None:
+            startup_status = "Not requested this launch"
+            startup_detail = "No startup Quick Scan was requested when AutoGuard opened."
+        elif startup_accepted:
+            startup_status = "Started this launch"
+            startup_detail = "The startup Quick Scan was accepted by the existing scan scheduler when AutoGuard opened."
+        else:
+            startup_status = "Skipped this launch"
+            startup_detail = "A startup Quick Scan was requested, but the scheduler did not dispatch another overlapping Quick Scan."
+        startup_scan = {
+            "requested_this_launch": startup_dispatch is not None,
+            "started_this_launch": startup_accepted,
+            "status": startup_status,
+            "detail": startup_detail,
         }
+
+        return {
+            "protection": {
+                "real_time": self._service_state(file_monitor),
+                "usb": self._service_state(usb_monitor),
+                "scheduled": {
+                    "available": True,
+                    "running": bool(getattr(scheduler_health, "running", False)),
+                    "status": "On" if bool(getattr(scheduler_health, "running", False)) else "Off",
+                    "detail": getattr(scheduler_health, "last_error", None) or (
+                        "Scheduled scanning is active."
+                        if bool(getattr(scheduler_health, "running", False))
+                        else "Scheduled scanning is currently stopped."
+                    ),
+                },
+                "startup_scan": startup_scan,
+            },
+            "schedule": {
+                "quick_hours": float(scheduler.settings.quick_interval_hours),
+                "full_days": float(scheduler.settings.full_interval_days),
+                "quick_scan_type": "Quick Scan",
+                "full_scan_type": "Full Scan",
+            },
+            "scan_preferences": {
+                "monitor_paths": monitor_paths,
+                "max_file_size_bytes": max_bytes,
+                "user_exclusions_supported": False,
+            },
+            "quarantine": {
+                "retention": "Until restored or deleted",
+                "detail": "AutoGuard keeps isolated files until you explicitly restore or permanently delete them.",
+            },
+            "application": {
+                "logs_dir": str(self.services.config.logs_dir),
+                "data_dir": str(self.services.config.data_dir),
+                "configuration_note": "Launch defaults come from AutoGuard startup configuration; runtime protection switches apply to this app session.",
+            },
+            "advanced": {
+                "database": str(self.services.config.database_path),
+                "quarantine_storage": str(self.services.config.quarantine_dir),
+                "debounce_seconds": getattr(file_monitor, "debounce_seconds", None),
+                "stability_seconds": getattr(file_monitor, "stability_period_seconds", None),
+                "usb_poll_seconds": getattr(usb_monitor, "poll_interval_seconds", None),
+                "quick_paths": tuple(str(path) for path in getattr(scheduler, "quick_paths", ())),
+                "full_paths": tuple(str(path) for path in getattr(scheduler, "full_paths", ())),
+            },
+        }
+
+    def set_protection_service(self, service_name: str, enabled: bool) -> None:
+        """Change only services that already expose safe start/stop lifecycle methods.
+
+        The service object remains the single source of truth.  No separate UI
+        preference is stored, and start() is never called when the service is
+        already running.
+        """
+        key = str(service_name).strip().lower()
+        if key not in {"real_time", "usb", "scheduled"}:
+            raise ValueError("Unknown protection service.")
+
+        def apply() -> dict[str, Any]:
+            if key == "real_time":
+                service = self.services.file_monitor
+                label = "Real-time protection"
+            elif key == "usb":
+                service = self.services.usb_monitor
+                label = "USB protection"
+            else:
+                service = self.services.scheduler
+                label = "Scheduled scanning"
+
+            if service is None:
+                raise RuntimeError(f"{label} is unavailable for this launch and cannot be enabled from Settings.")
+
+            health = service.health()
+            running = bool(getattr(health, "running", False))
+            requested = bool(enabled)
+            if running != requested:
+                if requested:
+                    service.start()
+                elif key == "scheduled":
+                    service.stop(wait=True, timeout=5.0)
+                else:
+                    service.stop(timeout=5.0)
+
+            updated = service.health()
+            is_running = bool(getattr(updated, "running", False))
+            if is_running != requested:
+                raise RuntimeError(f"{label} could not be {'enabled' if requested else 'disabled'} safely.")
+            return {
+                "service": key,
+                "enabled": is_running,
+                "title": f"{label} {'on' if is_running else 'off'}",
+                "message": (
+                    "The change is active for the current AutoGuard session."
+                    " Launch defaults are controlled by startup configuration."
+                ),
+            }
+
+        self._submit(f"settings-service:{key}", apply, "settings_applied")

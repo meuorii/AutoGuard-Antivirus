@@ -150,6 +150,10 @@ class MainWindow(ctk.CTk):
                     result.get("message", "The isolated file was permanently deleted."),
                     "warning",
                 )
+            elif message.kind == "settings_applied":
+                # Keep the global sidebar/Home protection summary synchronized
+                # after an existing runtime service is started or stopped.
+                self.controller.refresh_dashboard()
         self.after(90, self._drain_messages)
 
     def _periodic_home_refresh(self) -> None:

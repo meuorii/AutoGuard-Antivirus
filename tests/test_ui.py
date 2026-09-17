@@ -1671,3 +1671,183 @@ def test_ux_refresh_phase10_does_not_invent_protection_state_change_events_witho
     finally:
         controller.shutdown()
     assert feed == []
+
+
+def _phase11_runtime_services(tmp_path, *, file_running=True, usb_running=True, scheduler_running=True,
+                              file_available=True, usb_available=True):
+    class RuntimeService:
+        def __init__(self, running, *, paths=(), status_when_running="RUNNING"):
+            self.running = running
+            self.paths = tuple(Path(p) for p in paths)
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.start_thread = None
+            self.stop_thread = None
+            self.status_when_running = status_when_running
+            self.debounce_seconds = 1.0
+            self.stability_period_seconds = 1.0
+            self.poll_interval_seconds = 1.0
+
+        def health(self):
+            return SimpleNamespace(
+                running=self.running,
+                status=SimpleNamespace(value=self.status_when_running if self.running else "STOPPED"),
+                last_error=None,
+            )
+
+        def start(self):
+            self.start_calls += 1
+            self.start_thread = threading.get_ident()
+            self.running = True
+            return self.health()
+
+        def stop(self, *args, **kwargs):
+            self.stop_calls += 1
+            self.stop_thread = threading.get_ident()
+            self.running = False
+            return self.health()
+
+        def monitored_paths(self):
+            return self.paths
+
+    class Scheduler(RuntimeService):
+        def __init__(self, running):
+            super().__init__(running)
+            self.settings = SimpleNamespace(quick_interval_hours=24.0, full_interval_days=7.0)
+            self.quick_paths = (tmp_path / "Downloads", tmp_path / "Desktop", tmp_path / "Documents")
+            self.full_paths = self.quick_paths
+
+        def health(self):
+            base = super().health()
+            return SimpleNamespace(
+                running=base.running,
+                status=base.status,
+                last_error=base.last_error,
+                quick_scan_running=False,
+                full_scan_running=False,
+            )
+
+    protected = (tmp_path / "Downloads", tmp_path / "Desktop", tmp_path / "Documents")
+    file_service = RuntimeService(file_running, paths=protected) if file_available else None
+    usb_service = RuntimeService(usb_running) if usb_available else None
+    scheduler = Scheduler(scheduler_running)
+    config = SimpleNamespace(
+        data_dir=tmp_path / "AutoGuardData",
+        database_path=tmp_path / "AutoGuardData" / "database" / "autoguard.db",
+        quarantine_dir=tmp_path / "AutoGuardData" / "quarantine",
+        logs_dir=tmp_path / "AutoGuardData" / "logs",
+        max_file_size_bytes=512 * 1024 * 1024,
+    )
+    scanner = SimpleNamespace(max_file_size_bytes=512 * 1024 * 1024)
+    services = SimpleNamespace(
+        config=config,
+        scanner=scanner,
+        file_monitor=file_service,
+        usb_monitor=usb_service,
+        scheduler=scheduler,
+        startup_dispatch=SimpleNamespace(status="DISPATCHED", accepted=True),
+    )
+    return services, file_service, usb_service, scheduler
+
+
+def test_ux_refresh_phase11_settings_page_uses_clear_supported_sections_only():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/settings_page.py").read_text(encoding="utf-8")
+
+    for required in (
+        "Protection",
+        "Real-time protection",
+        "USB protection",
+        "Startup Quick Scan",
+        "Scheduled Scanning",
+        "Scan Preferences",
+        "Quarantine",
+        "Application",
+        "Advanced",
+        "Show advanced details",
+    ):
+        assert required in source
+
+    # Unsupported settings remain explanatory/read-only instead of fake widgets.
+    assert "Custom exclusions are not exposed" in source
+    assert "fake frequency editor" in source
+    assert "system tray" not in source.lower()
+    assert "notification" not in source.lower()
+
+
+def test_ux_refresh_phase11_snapshot_reflects_real_service_and_config_state(tmp_path):
+    services, _, _, _ = _phase11_runtime_services(
+        tmp_path, file_running=True, usb_running=False, scheduler_running=True
+    )
+    controller = AutoGuardUIController(services, UIMessageBus())
+    try:
+        snapshot = controller.settings_snapshot()
+        assert snapshot["protection"]["real_time"]["status"] == "On"
+        assert snapshot["protection"]["usb"]["status"] == "Off"
+        assert snapshot["protection"]["scheduled"]["status"] == "On"
+        assert snapshot["protection"]["startup_scan"]["status"] == "Started this launch"
+        assert snapshot["schedule"]["quick_hours"] == 24.0
+        assert snapshot["schedule"]["full_days"] == 7.0
+        assert snapshot["scan_preferences"]["max_file_size_bytes"] == 512 * 1024 * 1024
+        assert len(snapshot["scan_preferences"]["monitor_paths"]) == 3
+        assert snapshot["quarantine"]["retention"] == "Until restored or deleted"
+        assert snapshot["application"]["logs_dir"].endswith("logs")
+    finally:
+        controller.shutdown()
+
+
+def test_ux_refresh_phase11_runtime_switches_use_existing_services_off_ui_thread_without_duplicate_start(tmp_path):
+    services, file_service, _, _ = _phase11_runtime_services(
+        tmp_path, file_running=False, usb_running=True, scheduler_running=True
+    )
+    bus = UIMessageBus()
+    controller = AutoGuardUIController(services, bus)
+    caller = threading.get_ident()
+    try:
+        controller.set_protection_service("real_time", True)
+        message, _ = wait_for(bus, "settings_applied")
+        assert message.payload["result"]["enabled"] is True
+        assert file_service.start_calls == 1
+        assert file_service.start_thread != caller
+
+        # Requesting the already-active state must not start another monitor.
+        controller.set_protection_service("real_time", True)
+        message, _ = wait_for(bus, "settings_applied")
+        assert message.payload["result"]["enabled"] is True
+        assert file_service.start_calls == 1
+    finally:
+        controller.shutdown()
+
+
+def test_ux_refresh_phase11_scheduler_switch_reuses_single_scheduler_and_stops_safely(tmp_path):
+    services, _, _, scheduler = _phase11_runtime_services(
+        tmp_path, scheduler_running=True
+    )
+    bus = UIMessageBus()
+    controller = AutoGuardUIController(services, bus)
+    try:
+        controller.set_protection_service("scheduled", False)
+        message, _ = wait_for(bus, "settings_applied")
+        assert message.payload["result"]["enabled"] is False
+        assert scheduler.stop_calls == 1
+
+        controller.set_protection_service("scheduled", False)
+        wait_for(bus, "settings_applied")
+        assert scheduler.stop_calls == 1
+    finally:
+        controller.shutdown()
+
+
+def test_ux_refresh_phase11_unavailable_service_is_not_emulated_with_ui_state(tmp_path):
+    services, _, _, _ = _phase11_runtime_services(tmp_path, file_available=False)
+    bus = UIMessageBus()
+    controller = AutoGuardUIController(services, bus)
+    try:
+        snapshot = controller.settings_snapshot()
+        assert snapshot["protection"]["real_time"]["available"] is False
+        assert snapshot["protection"]["real_time"]["status"] == "Unavailable for this launch"
+
+        controller.set_protection_service("real_time", True)
+        failed, _ = wait_for(bus, "task_failed")
+        assert "unavailable for this launch" in failed.payload["error"].lower()
+    finally:
+        controller.shutdown()
