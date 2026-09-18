@@ -29,4 +29,6 @@ exe = EXE(
     bootloader_ignore_signals=False, strip=False, upx=True, upx_exclude=[],
     runtime_tmpdir=None, console=False, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
+    icon=str(project_root / "assets" / "autoguard.ico"),
+    version=str(project_root / "version_info.txt"),
 )
