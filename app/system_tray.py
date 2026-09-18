@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from app.logging_config import application_logger
+from app.protection_state import state_from_health, state_from_service
 from app.resources import autoguard_logo_path
 from app.startup import AutoGuardServices
 
@@ -37,11 +38,12 @@ class TrayStatus:
 
     @property
     def protection(self) -> str:
-        if self.real_time == "On":
-            return "On"
-        if self.real_time == "Unavailable":
-            return "Unavailable"
-        return "Attention needed"
+        states = (self.real_time, self.usb, self.scheduled)
+        if any(value in {"Off", "Unavailable"} for value in states):
+            return "Protection issue"
+        if any(value == "Needs attention" for value in states):
+            return "Needs attention"
+        return "On"
 
 
 class SystemTray:
@@ -161,7 +163,7 @@ class SystemTray:
         usb_state = self._service_state(self.services.usb_monitor)
         try:
             scheduler_health = self.services.scheduler.health()
-            scheduled = "On" if bool(getattr(scheduler_health, "running", False)) else "Off"
+            scheduled = state_from_health(scheduler_health).status
             quick_running = bool(getattr(scheduler_health, "quick_scan_running", False))
             full_running = bool(getattr(scheduler_health, "full_scan_running", False))
         except Exception:
@@ -191,13 +193,7 @@ class SystemTray:
 
     @staticmethod
     def _service_state(service: Any | None) -> str:
-        if service is None:
-            return "Unavailable"
-        try:
-            health = service.health()
-        except Exception:
-            return "Unavailable"
-        return "On" if bool(getattr(health, "running", False)) else "Off"
+        return state_from_service(service).status
 
     @staticmethod
     def _format_next(value: datetime | None) -> str:

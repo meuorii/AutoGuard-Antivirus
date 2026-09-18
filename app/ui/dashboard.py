@@ -83,7 +83,7 @@ class _ProtectionRow(ctk.CTkFrame):
         self.state = ctk.CTkLabel(
             self,
             text="Checking",
-            width=64,
+            width=104,
             height=26,
             corner_radius=7,
             fg_color=theme.SURFACE_ALT,
@@ -92,12 +92,15 @@ class _ProtectionRow(ctk.CTkFrame):
         )
         self.state.grid(row=0, column=1, padx=(16, 0), sticky="e")
 
-    def set(self, enabled: bool) -> None:
-        self.state.configure(
-            text="On" if enabled else "Off",
-            text_color=theme.SUCCESS if enabled else theme.TEXT_MUTED,
-            fg_color=theme.SUCCESS_DARK if enabled else theme.SURFACE_ALT,
-        )
+    def set(self, status: str) -> None:
+        text = str(status or "Unavailable")
+        color, background = {
+            "On": (theme.SUCCESS, theme.SUCCESS_DARK),
+            "Needs attention": (theme.WARNING, theme.WARNING_DARK),
+            "Off": (theme.TEXT_MUTED, theme.SURFACE_ALT),
+            "Unavailable": (theme.TEXT_MUTED, theme.SURFACE_ALT),
+        }.get(text, (theme.TEXT_MUTED, theme.SURFACE_ALT))
+        self.state.configure(text=text, text_color=color, fg_color=background)
 
 
 class _ActivityRow(ctk.CTkFrame):
@@ -341,7 +344,8 @@ class DashboardPage(BasePage):
 
         protection = data["protection"]
         for key, row in self.protection_rows.items():
-            row.set(bool(protection[key]))
+            state = protection[key]
+            row.set(state.get("status", "Unavailable"))
 
         for child in self.recent.winfo_children():
             child.destroy()

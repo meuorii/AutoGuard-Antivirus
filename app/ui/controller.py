@@ -20,6 +20,7 @@ from app.explanations import ExplanationContext, build_explanation
 from app.incidents import IncidentEventType, IncidentStatus
 from app.models import DetectionStatus, ScanResult, ScanSource, ScanStatus, ScanType
 from app.quarantine import QuarantineIntegrityStatus, QuarantineState
+from app.protection_state import state_from_health, state_from_service
 from app.recovery import RecoveryStatus
 from app.scanner import ScanInterruptedError
 from app.startup import AutoGuardServices
@@ -104,11 +105,14 @@ class AutoGuardUIController:
         self._submit_once("refresh-dashboard", self._dashboard_snapshot, "dashboard_data")
 
     @staticmethod
-    def _health_running(health: Any | None) -> bool:
-        if health is None or not bool(getattr(health, "running", False)):
-            return False
-        status = getattr(getattr(health, "status", None), "value", None)
-        return status is None or str(status).upper() == "RUNNING"
+    def _protection_row(health: Any | None, *, available: bool = True) -> dict[str, Any]:
+        state = state_from_health(health, available=available)
+        return {
+            "available": state.available,
+            "running": state.running,
+            "status": state.status,
+            "detail": state.detail,
+        }
 
     @staticmethod
     def _display_name(path: str) -> str:
@@ -136,12 +140,22 @@ class AutoGuardUIController:
         active_incidents = self.services.incidents.get_active_incidents()
         recent = self.services.scanner.history.recent_scans(16)
 
+        file_state = state_from_health(file_health, available=self.services.file_monitor is not None)
+        usb_state = state_from_health(usb_health, available=self.services.usb_monitor is not None)
+        scheduler_state = state_from_health(scheduler_health)
         protection = {
-            "real_time": self._health_running(file_health),
-            "usb": self._health_running(usb_health),
-            "scheduled": bool(getattr(scheduler_health, "running", False)),
+            "real_time": self._protection_row(file_health, available=self.services.file_monitor is not None),
+            "usb": self._protection_row(usb_health, available=self.services.usb_monitor is not None),
+            "scheduled": self._protection_row(scheduler_health),
         }
-        protection_ok = all(protection.values())
+        protection_stopped = any(
+            state.status in {"Off", "Unavailable"}
+            for state in (file_state, usb_state, scheduler_state)
+        )
+        protection_degraded = any(
+            state.status == "Needs attention"
+            for state in (file_state, usb_state, scheduler_state)
+        )
 
         review_statuses = {
             IncidentStatus.OPEN,
@@ -165,11 +179,17 @@ class AutoGuardUIController:
 
         # Priority keeps genuine protection failures and review-needed threats
         # visible even if a scan is also running.
-        if not protection_ok:
+        if protection_stopped:
             protection_state = {
                 "key": "issue",
                 "title": "Protection issue",
                 "message": "One or more protection services are not running.",
+            }
+        elif protection_degraded:
+            protection_state = {
+                "key": "attention",
+                "title": "Attention needed",
+                "message": "Protection is running, but one or more services need attention.",
             }
         elif threats_needing_review:
             protection_state = {
@@ -1765,28 +1785,19 @@ class AutoGuardUIController:
 
     @staticmethod
     def _service_state(service: Any | None) -> dict[str, Any]:
-        if service is None:
-            return {
-                "available": False,
-                "running": False,
-                "status": "Unavailable for this launch",
-                "detail": "This protection service was not created by the current startup configuration.",
-            }
-        health = service.health()
-        running = bool(getattr(health, "running", False))
-        raw_status = getattr(getattr(health, "status", None), "value", None)
-        if raw_status is None:
-            status = "On" if running else "Off"
-        else:
-            status = {
-                "RUNNING": "On",
-                "STOPPED": "Off",
-                "DEGRADED": "Needs attention",
-            }.get(str(raw_status).upper(), "On" if running else "Off")
-        detail = getattr(health, "last_error", None) or (
-            "Protection is active." if running else "Protection is currently stopped."
+        state = state_from_service(
+            service,
+            unavailable_label="Unavailable for this launch",
+            unavailable_detail=(
+                "This protection service was not created by the current startup configuration."
+            ),
         )
-        return {"available": True, "running": running, "status": status, "detail": detail}
+        return {
+            "available": state.available,
+            "running": state.running,
+            "status": state.status,
+            "detail": state.detail,
+        }
 
     def settings_snapshot(self) -> dict[str, Any]:
         """Return a read model backed only by real configuration/service state."""
@@ -1794,6 +1805,7 @@ class AutoGuardUIController:
         usb_monitor = self.services.usb_monitor
         scheduler = self.services.scheduler
         scheduler_health = scheduler.health()
+        scheduler_state = state_from_health(scheduler_health)
 
         monitor_paths = tuple(
             str(path) for path in (
@@ -1822,19 +1834,36 @@ class AutoGuardUIController:
             "detail": startup_detail,
         }
 
+        notification_service = getattr(self.services, "notifications", None)
+        notification_health = notification_service.health() if notification_service is not None else None
+        notification_available = bool(getattr(notification_health, "available", False))
+        notification_enabled = bool(getattr(notification_health, "enabled", False))
+        notification_status = (
+            "On" if notification_available
+            else ("Unavailable" if notification_enabled else "Off")
+        )
+        notification_detail = (
+            "New files in Downloads receive a verdict notification; suspicious and confirmed threats notify from any monitored location."
+            if notification_available
+            else (
+                getattr(notification_health, "last_error", None)
+                or (
+                    "Windows notifications are enabled, but the native notification backend is not available in this environment."
+                    if notification_enabled
+                    else "Windows file notifications were disabled at launch."
+                )
+            )
+        )
+
         return {
             "protection": {
                 "real_time": self._service_state(file_monitor),
                 "usb": self._service_state(usb_monitor),
                 "scheduled": {
-                    "available": True,
-                    "running": bool(getattr(scheduler_health, "running", False)),
-                    "status": "On" if bool(getattr(scheduler_health, "running", False)) else "Off",
-                    "detail": getattr(scheduler_health, "last_error", None) or (
-                        "Scheduled scanning is active."
-                        if bool(getattr(scheduler_health, "running", False))
-                        else "Scheduled scanning is currently stopped."
-                    ),
+                    "available": scheduler_state.available,
+                    "running": scheduler_state.running,
+                    "status": scheduler_state.status,
+                    "detail": scheduler_state.detail,
                 },
                 "startup_scan": startup_scan,
             },
@@ -1856,6 +1885,12 @@ class AutoGuardUIController:
             "application": {
                 "logs_dir": str(self.services.config.logs_dir),
                 "data_dir": str(self.services.config.data_dir),
+                "windows_notifications": {
+                    "status": notification_status,
+                    "available": notification_available,
+                    "enabled": notification_enabled,
+                    "detail": notification_detail,
+                },
                 "configuration_note": "Launch defaults come from AutoGuard startup configuration; runtime protection switches apply to this app session.",
             },
             "advanced": {

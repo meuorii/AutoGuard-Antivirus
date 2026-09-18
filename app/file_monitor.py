@@ -493,6 +493,10 @@ class FileMonitor:
                 return
             with self._lock:
                 self._scans_dispatched += 1
+                # A previous per-file stability/scan failure is transient. Once a
+                # later real-time scan succeeds, clear that stale error so health
+                # can recover from DEGRADED when observer/workers are healthy.
+                self._last_error = None
             if self._on_scan_result is not None:
                 try:
                     self._on_scan_result(result, request.event_type)
