@@ -8,7 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import customtkinter as ctk
+from PIL import Image, ImageTk
 
+from app.resources import autoguard_logo_path
 from app.startup import AutoGuardServices
 from app.system_tray import SystemTray, TrayAction
 from app.ui import theme
@@ -78,6 +80,7 @@ class MainWindow(ctk.CTk):
         self.geometry("1320x820")
         self.minsize(1080, 680)
         self.configure(fg_color=theme.BG)
+        self._apply_window_icon()
         self.protocol("WM_DELETE_WINDOW", self._handle_window_close)
 
         # Services are created by startup and referenced by one controller.
@@ -114,6 +117,17 @@ class MainWindow(ctk.CTk):
         self.after(700, self._periodic_visible_refresh)
         if initial_path is not None:
             self.after(450, lambda: self.controller.start_scan(initial_path))
+
+    def _apply_window_icon(self) -> None:
+        """Use the official transparent AutoGuard shield for the Windows shell."""
+        try:
+            image = Image.open(autoguard_logo_path()).convert("RGBA")
+            image.thumbnail((64, 64), Image.Resampling.LANCZOS)
+            self._window_icon = ImageTk.PhotoImage(image)
+            self.iconphoto(True, self._window_icon)
+        except Exception:
+            # Branding must never prevent the protection UI from starting.
+            self._window_icon = None
 
     @property
     def active_page(self) -> str | None:

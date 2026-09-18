@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from app.logging_config import application_logger
+from app.resources import autoguard_logo_path
 from app.startup import AutoGuardServices
 
 
@@ -225,18 +226,19 @@ class SystemTray:
     def _create_windows_icon(self) -> Any:
         try:
             import pystray
-            from PIL import Image, ImageDraw
+            from PIL import Image
         except ImportError as error:
             raise RuntimeError(
                 "System tray dependencies are missing. Install requirements.txt."
             ) from error
 
-        image = Image.new("RGBA", (64, 64), (16, 21, 22, 255))
-        draw = ImageDraw.Draw(image)
-        # Compact AutoGuard shield/check mark that remains legible at tray size.
-        draw.rounded_rectangle((9, 7, 55, 57), radius=13, fill=(84, 230, 212, 255))
-        draw.polygon(((32, 14), (48, 21), (45, 42), (32, 52), (19, 42), (16, 21)), fill=(16, 21, 22, 255))
-        draw.line((23, 32, 29, 39, 42, 25), fill=(84, 230, 212, 255), width=5)
+        image = Image.open(autoguard_logo_path()).convert("RGBA")
+        image.thumbnail((64, 64), Image.Resampling.LANCZOS)
+        tray_image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        tray_image.alpha_composite(
+            image, ((64 - image.width) // 2, (64 - image.height) // 2)
+        )
+        image = tray_image
 
         def disabled(text_provider: Callable[[], str]):
             return pystray.MenuItem(
