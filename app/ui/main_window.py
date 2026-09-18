@@ -10,7 +10,11 @@ from pathlib import Path
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-from app.resources import autoguard_logo_path
+from app.resources import (
+    autoguard_icon_path,
+    autoguard_logo_path,
+    configure_windows_app_identity,
+)
 from app.startup import AutoGuardServices
 from app.system_tray import SystemTray, TrayAction
 from app.ui import theme
@@ -81,6 +85,10 @@ class MainWindow(ctk.CTk):
         self.minsize(1080, 680)
         self.configure(fg_color=theme.BG)
         self._apply_window_icon()
+        # CustomTkinter applies its own Windows title-bar icon shortly after the
+        # root window is created. Re-apply AutoGuard branding after that delayed
+        # setup so the title bar/taskbar do not fall back to Tk/Python branding.
+        self.after(500, self._apply_window_icon)
         self.protocol("WM_DELETE_WINDOW", self._handle_window_close)
 
         # Services are created by startup and referenced by one controller.
@@ -119,7 +127,19 @@ class MainWindow(ctk.CTk):
             self.after(450, lambda: self.controller.start_scan(initial_path))
 
     def _apply_window_icon(self) -> None:
-        """Use the official transparent AutoGuard shield for the Windows shell."""
+        """Apply the official AutoGuard icon to Tk and the Windows shell."""
+        # On Windows the ICO is the authoritative small/title-bar icon.
+        # ``default=`` also applies it to future Tk/Toplevel windows.
+        try:
+            icon_path = autoguard_icon_path()
+            if icon_path.is_file():
+                self.iconbitmap(default=str(icon_path))
+        except Exception:
+            # iconbitmap is platform-specific; the PNG fallback below remains.
+            pass
+
+        # Keep a PhotoImage reference so Tk can also use the transparent source
+        # artwork on platforms/contexts that prefer iconphoto.
         try:
             image = Image.open(autoguard_logo_path()).convert("RGBA")
             image.thumbnail((64, 64), Image.Resampling.LANCZOS)
@@ -277,6 +297,9 @@ class MainWindow(ctk.CTk):
             return
         self._hidden_to_tray = False
         self.deiconify()
+        # Restore the branded shell icon as well; some Windows/Tk combinations
+        # can refresh title-bar state after withdraw/deiconify.
+        self._apply_window_icon()
         try:
             self.lift()
             self.focus_force()
@@ -300,6 +323,7 @@ def launch_desktop(
     enable_system_tray: bool = True,
 ) -> None:
     """Create and run the Windows desktop UI on the caller/main thread."""
+    configure_windows_app_identity()
     MainWindow(
         services, initial_path=initial_path, enable_system_tray=enable_system_tray
     ).mainloop()

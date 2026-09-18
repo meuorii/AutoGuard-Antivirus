@@ -6,10 +6,13 @@ from pathlib import Path
 
 from app.config import AppConfig
 from app.scheduler import ScheduleSettings
+from app.resources import configure_windows_app_identity
 from app.startup import AutoGuardStartup, StartupSettings
 
 
 def main() -> None:
+    # Establish AutoGuard's own Windows taskbar identity before Tk is created.
+    configure_windows_app_identity()
     config = AppConfig()
     parser = argparse.ArgumentParser(description="AutoGuard automatic protection")
     parser.add_argument("path", nargs="?", type=Path, help="Optional file/directory to scan after the UI opens")
