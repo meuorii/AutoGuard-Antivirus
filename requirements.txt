@@ -3,3 +3,5 @@ watchdog>=4.0.0
 APScheduler>=3.10,<4
 customtkinter>=5.2,<6
 winotify>=1.1,<2
+pystray>=0.19,<1
+Pillow>=9.5,<13

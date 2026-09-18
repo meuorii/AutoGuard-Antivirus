@@ -10,6 +10,7 @@ from pathlib import Path
 import customtkinter as ctk
 
 from app.startup import AutoGuardServices
+from app.system_tray import SystemTray, TrayAction
 from app.ui import theme
 from app.ui.activity_page import ActivityPage
 from app.ui.components import NotificationCenter
@@ -67,14 +68,17 @@ PASSIVE_REFRESH_MS = 10000
 class MainWindow(ctk.CTk):
     """Responsive shell with one centrally managed active-page state."""
 
-    def __init__(self, services: AutoGuardServices, *, initial_path: Path | None = None):
+    def __init__(
+        self, services: AutoGuardServices, *, initial_path: Path | None = None,
+        enable_system_tray: bool = True,
+    ):
         super().__init__()
         ctk.set_appearance_mode("dark")
         self.title("AutoGuard")
         self.geometry("1320x820")
         self.minsize(1080, 680)
         self.configure(fg_color=theme.BG)
-        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.protocol("WM_DELETE_WINDOW", self._handle_window_close)
 
         # Services are created by startup and referenced by one controller.
         # Navigation never reconnects the database or restarts protection.
@@ -82,7 +86,9 @@ class MainWindow(ctk.CTk):
         self.controller = AutoGuardUIController(services, self.bus)
         self.notifications = NotificationCenter(self)
         self._closing = False
+        self._hidden_to_tray = False
         self._active_page: str | None = None
+        self.tray = SystemTray(services, enabled=enable_system_tray)
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -102,7 +108,9 @@ class MainWindow(ctk.CTk):
             page.grid(row=0, column=0, sticky="nsew")
 
         self.show_page(DEFAULT_PAGE)
+        self.tray.start()
         self.after(90, self._drain_messages)
+        self.after(120, self._drain_tray_actions)
         self.after(700, self._periodic_visible_refresh)
         if initial_path is not None:
             self.after(450, lambda: self.controller.start_scan(initial_path))
@@ -212,19 +220,72 @@ class MainWindow(ctk.CTk):
         """
         if self._closing:
             return
-        # Background file/USB activity may bypass the UI message bus. Keep the
-        # global Home/sidebar health snapshot current regardless of active page.
-        self.controller.refresh_dashboard()
-        if self._active_page in PASSIVE_REFRESH_PAGES and self._active_page != "home":
-            self._refresh_visible_page("background-sync")
+        # Never leave the only window unreachable if the tray backend exits.
+        if self._hidden_to_tray and not self.tray.running:
+            self._restore_from_tray()
+        # When hidden to tray, protection services keep running but there is no
+        # reason to repaint hidden Tk pages. The tray reads service health directly.
+        if not self._hidden_to_tray:
+            self.controller.refresh_dashboard()
+            if self._active_page in PASSIVE_REFRESH_PAGES and self._active_page != "home":
+                self._refresh_visible_page("background-sync")
+        self.tray.refresh_menu()
         self.after(PASSIVE_REFRESH_MS, self._periodic_visible_refresh)
 
-    def _close(self) -> None:
+    def _drain_tray_actions(self) -> None:
+        """Handle tray callbacks on Tk's main thread only."""
+        if self._closing:
+            return
+        for action in self.tray.drain_actions():
+            if action is TrayAction.OPEN:
+                self._restore_from_tray()
+            elif action is TrayAction.QUICK_SCAN:
+                self.controller.start_quick_scan()
+                self.tray.refresh_menu()
+            elif action is TrayAction.EXIT:
+                self._exit_application()
+                return
+        self.after(120, self._drain_tray_actions)
+
+    def _handle_window_close(self) -> None:
+        """Hide to the tray when available; otherwise keep legacy real exit."""
+        if self._closing:
+            return
+        if self.tray.running:
+            self._hidden_to_tray = True
+            self.withdraw()
+            self.tray.refresh_menu()
+            return
+        self._exit_application()
+
+    def _restore_from_tray(self) -> None:
+        if self._closing:
+            return
+        self._hidden_to_tray = False
+        self.deiconify()
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+        self.controller.refresh_dashboard()
+        self._refresh_visible_page("tray-open")
+
+    def _exit_application(self) -> None:
+        """Exit the UI; main.py remains the owner of backend service shutdown."""
+        if self._closing:
+            return
         self._closing = True
+        self.tray.stop(timeout=1.5)
         self.controller.shutdown()
         self.destroy()
 
 
-def launch_desktop(services: AutoGuardServices, initial_path: Path | None = None) -> None:
+def launch_desktop(
+    services: AutoGuardServices, initial_path: Path | None = None, *,
+    enable_system_tray: bool = True,
+) -> None:
     """Create and run the Windows desktop UI on the caller/main thread."""
-    MainWindow(services, initial_path=initial_path).mainloop()
+    MainWindow(
+        services, initial_path=initial_path, enable_system_tray=enable_system_tray
+    ).mainloop()

@@ -19,5 +19,23 @@ def test_packaging_configuration_bundles_signatures_and_keeps_runtime_data_exter
     root = Path(__file__).resolve().parents[1]; spec = (root / "AutoGuard.spec").read_text(encoding="utf-8"); config = (root / "app/config.py").read_text(encoding="utf-8")
     assert "data/signatures.json" in spec.replace("\\\\", "/") or "signatures.json" in spec
     assert "customtkinter" in spec and "collect_data_files" in spec
-    assert 'Path.home() / "AutoGuardData"' in config
+    assert "Path.home() / \"AutoGuardData\"" in config
     store = load_signatures(); assert store.lookup(AUTOGUARD_TEST_SHA256) is not None
+
+
+def test_windows_notification_dependency_is_packaged():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    spec = (root / "AutoGuard.spec").read_text(encoding="utf-8")
+    assert "winotify" in requirements
+    assert 'collect_submodules("winotify")' in spec
+
+
+def test_system_tray_dependencies_are_packaged():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    spec = (root / "AutoGuard.spec").read_text(encoding="utf-8")
+    assert "pystray" in requirements
+    assert "Pillow" in requirements
+    assert 'collect_submodules("pystray")' in spec
+    assert 'collect_submodules("PIL")' in spec
