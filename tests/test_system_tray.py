@@ -8,11 +8,16 @@ from app.system_tray import SystemTray, TrayAction
 
 
 class FakeHealthService:
-    def __init__(self, running: bool):
+    def __init__(self, running: bool, *, status: str | None = None, last_error: str | None = None):
         self.running = running
+        self.status = status
+        self.last_error = last_error
 
     def health(self):
-        return SimpleNamespace(running=self.running)
+        raw_status = SimpleNamespace(value=self.status) if self.status is not None else None
+        return SimpleNamespace(
+            running=self.running, status=raw_status, last_error=self.last_error
+        )
 
 
 class FakeScheduler:
@@ -68,6 +73,20 @@ def test_tray_status_reads_existing_service_health_and_schedule():
     assert status.next_full_scan is not None
 
 
+
+def test_tray_reports_running_degraded_service_as_needs_attention_not_on():
+    current = services()
+    current.file_monitor = FakeHealthService(
+        True, status="DEGRADED", last_error="temporary monitor problem"
+    )
+    tray = SystemTray(
+        current, platform_name="nt", enabled=True, icon_factory=lambda _: FakeIcon()
+    )
+    status = tray.status_snapshot()
+    assert status.real_time == "Needs attention"
+    assert status.protection == "Needs attention"
+
+
 def test_tray_actions_are_queued_for_tk_main_thread():
     tray = SystemTray(services(), platform_name="nt", enabled=True, icon_factory=lambda _: FakeIcon())
     tray.request(TrayAction.OPEN)
@@ -112,3 +131,20 @@ def test_main_window_close_contract_hides_to_tray_and_has_explicit_exit():
     assert "self.withdraw()" in source
     assert "TrayAction.EXIT" in source
     assert "self.tray.stop" in source
+
+
+def test_tray_exposes_live_automatic_scan_progress():
+    now = datetime.now(timezone.utc)
+    current = services()
+    progress = SimpleNamespace(
+        label="Startup Quick Scan",
+        files_checked=8421,
+        threats_found=0,
+    )
+    current.scheduler.active_scan_progress = lambda: progress
+    tray = SystemTray(current, platform_name="nt", enabled=True, icon_factory=lambda _: FakeIcon())
+    status = tray.status_snapshot()
+    assert status.active_scan_label == "Startup Quick Scan"
+    assert status.files_checked == 8421
+    assert status.threats_found == 0
+    assert status.scan_running is True

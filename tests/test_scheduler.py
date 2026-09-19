@@ -209,3 +209,45 @@ def test_scheduler_exposes_backend_next_run_times_for_tray(tmp_path):
         assert times["full"] > times["quick"]
     finally:
         scheduler.stop()
+
+
+def test_automatic_scan_exposes_live_files_checked_progress(tmp_path):
+    from app.models import ScanResult, ScanStatus, ScanSummary
+
+    class ProgressScanner:
+        def __init__(self):
+            self.progress_ready = threading.Event()
+            self.release = threading.Event()
+
+        def scan(
+            self, path, source, *, scan_type, interrupt_check=None,
+            on_result=None, on_discovered=None,
+        ):
+            for index in range(3):
+                item = Path(path) / f"file-{index}.txt"
+                if on_discovered is not None:
+                    on_discovered(str(item), "file")
+                result = ScanResult(str(item), ScanStatus.SCANNED, "Checked successfully.")
+                if on_result is not None:
+                    on_result(result)
+                if index == 1:
+                    self.progress_ready.set()
+                    self.release.wait(1.0)
+            return ScanSummary((), session_id="progress-session")
+
+    scanner = ProgressScanner()
+    scheduler = ScanScheduler(scanner, quick_paths=(tmp_path,), full_paths=(tmp_path,))
+    assert scheduler.dispatch_startup_scan().accepted
+    assert scanner.progress_ready.wait(1.0)
+
+    progress = scheduler.active_scan_progress()
+    assert progress is not None
+    assert progress.label == "Startup Quick Scan"
+    assert progress.ui_type == "startup"
+    assert progress.files_checked == 2
+    assert progress.processed == 2
+    assert progress.discovered == 2
+    assert "file-1.txt" in progress.current_path
+
+    scanner.release.set()
+    assert wait_until(lambda: scheduler.active_scan_progress() is None)

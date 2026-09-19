@@ -296,6 +296,30 @@ def test_ux_refresh_phase2_home_uses_only_four_user_facing_protection_states():
         controller.shutdown()
 
 
+
+def test_final_protection_status_is_consistent_for_running_degraded_realtime_service():
+    controller = AutoGuardUIController(_home_services(), UIMessageBus())
+    degraded = SimpleNamespace(
+        running=True,
+        status=SimpleNamespace(value="DEGRADED"),
+        last_error="A temporary file could not be scanned.",
+    )
+    controller.services.file_monitor = SimpleNamespace(health=lambda: degraded)
+    try:
+        snapshot = controller._dashboard_snapshot()
+        assert snapshot["protection"]["real_time"]["running"] is True
+        assert snapshot["protection"]["real_time"]["status"] == "Needs attention"
+        assert snapshot["protection_state"] == {
+            "key": "attention",
+            "title": "Attention needed",
+            "message": "Protection is running, but one or more services need attention.",
+        }
+        settings = controller._service_state(controller.services.file_monitor)
+        assert settings["running"] is True
+        assert settings["status"] == "Needs attention"
+    finally:
+        controller.shutdown()
+
 def test_ux_refresh_phase2_contained_incident_does_not_force_attention_state():
     from app.incidents import IncidentStatus
 
@@ -1770,8 +1794,8 @@ def test_ux_refresh_phase11_settings_page_uses_clear_supported_sections_only():
     # Unsupported settings remain explanatory/read-only instead of fake widgets.
     assert "Custom exclusions are not exposed" in source
     assert "fake frequency editor" in source
-    assert "system tray" not in source.lower()
-    assert "notification" not in source.lower()
+    assert "Start AutoGuard with Windows" in source
+    assert "set_windows_startup" in source
 
 
 def test_ux_refresh_phase11_snapshot_reflects_real_service_and_config_state(tmp_path):
@@ -1964,3 +1988,32 @@ def test_loading_state_hotfix_applies_same_rule_to_quarantine_navigation():
     assert "was_loading = self._loading" in source
     assert "if was_loading or result != self._list_data:" in source
     assert "if was_loading or result != self._detail_data:" in source
+
+
+def test_windows_notification_milestone_surfaces_real_runtime_state_in_settings():
+    source = (Path(__file__).resolve().parents[1] / "app/ui/settings_page.py").read_text(encoding="utf-8")
+    controller = (Path(__file__).resolve().parents[1] / "app/ui/controller.py").read_text(encoding="utf-8")
+    assert "Windows file notifications" in source
+    assert '"windows_notifications"' in controller
+    assert "Start AutoGuard with Windows" in source
+    assert "set_windows_startup" in source
+
+
+def test_scan_page_polls_existing_automatic_scan_progress():
+    root = Path(__file__).resolve().parents[1]
+    scan_page = (root / "app/ui/scan_page.py").read_text(encoding="utf-8")
+    controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
+    assert "def automatic_scan_progress" in controller
+    assert "def _poll_automatic_scan" in scan_page
+    assert "stoppable=False" in scan_page
+    assert 'progress.get("files_checked", 0)' in scan_page
+
+
+def test_dashboard_and_tray_surface_automatic_scan_count():
+    root = Path(__file__).resolve().parents[1]
+    dashboard = (root / "app/ui/dashboard.py").read_text(encoding="utf-8")
+    tray = (root / "app/system_tray.py").read_text(encoding="utf-8")
+    assert 'data.get("active_scan")' in dashboard
+    assert "checked · In progress" in dashboard
+    assert "active_scan_label" in tray
+    assert "files checked" in tray
