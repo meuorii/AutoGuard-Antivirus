@@ -1,0 +1,39 @@
+AutoGuard Software License Agreement
+Version 1.0.0
+
+Copyright (c) 2026 AutoGuard. All rights reserved.
+
+PLEASE READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING AUTOGUARD.
+BY INSTALLING OR USING THE SOFTWARE, YOU AGREE TO THE TERMS BELOW.
+
+1. LICENSE GRANT
+AutoGuard grants you a non-exclusive, non-transferable license to install and use this version of AutoGuard on computers that you own or are authorized to administer.
+
+2. PERMITTED USE
+You may use AutoGuard for personal, educational, evaluation, or internal business purposes. You may make reasonable backup copies for your own use.
+
+3. RESTRICTIONS
+Unless you have written permission from the copyright holder, you may not sell, sublicense, rent, lease, or commercially redistribute AutoGuard. You may not remove copyright, product identity, or license notices from the software.
+
+4. SECURITY SOFTWARE LIMITATIONS
+AutoGuard is security software designed to scan supported files and monitored locations using its configured detection rules and signatures. No security product can guarantee that every malicious, unsafe, or unwanted file will be detected. A result such as "No threats detected" means only that AutoGuard did not identify a threat using the checks that were successfully completed at that time.
+
+5. USER DATA AND QUARANTINE
+AutoGuard may create local application data, including scan history, logs, threat records, configuration information, and quarantined files. You are responsible for maintaining appropriate backups of important data. Uninstalling AutoGuard may intentionally preserve security history or quarantine data unless you remove that data separately.
+
+6. NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT, TO THE MAXIMUM EXTENT PERMITTED BY LAW.
+
+7. LIMITATION OF LIABILITY
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER WILL NOT BE LIABLE FOR INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, PROFITS, OR BUSINESS, ARISING FROM THE USE OR INABILITY TO USE AUTOGUARD.
+
+8. TERMINATION
+This license ends automatically if you materially violate these terms. When the license ends, you must stop using and distributing the software except where applicable law provides otherwise.
+
+9. THIRD-PARTY COMPONENTS
+AutoGuard may include or depend on third-party open-source libraries. Those components remain subject to their respective licenses.
+
+10. ENTIRE AGREEMENT
+This document is the agreement for this release unless a separate written agreement is provided by the copyright holder.
+
+If you do not agree to these terms, do not install or use AutoGuard.
