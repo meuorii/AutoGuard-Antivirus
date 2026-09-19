@@ -24,13 +24,21 @@ from app.protection_state import state_from_health, state_from_service
 from app.recovery import RecoveryStatus
 from app.scanner import ScanInterruptedError
 from app.startup import AutoGuardServices
+from app.windows_startup import WindowsStartupManager
 from app.ui.messages import UIMessageBus
 
 
 class AutoGuardUIController:
-    def __init__(self, services: AutoGuardServices, bus: UIMessageBus | None = None) -> None:
+    def __init__(
+        self,
+        services: AutoGuardServices,
+        bus: UIMessageBus | None = None,
+        *,
+        windows_startup: WindowsStartupManager | None = None,
+    ) -> None:
         self.services = services
         self.bus = bus if bus is not None else UIMessageBus()
+        self.windows_startup = windows_startup if windows_startup is not None else WindowsStartupManager()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="AutoGuardUI")
         self._lock = threading.RLock()
         self._active_tasks: set[str] = set()
@@ -1855,6 +1863,8 @@ class AutoGuardUIController:
             )
         )
 
+        windows_startup = self.windows_startup.state()
+
         return {
             "protection": {
                 "real_time": self._service_state(file_monitor),
@@ -1891,7 +1901,13 @@ class AutoGuardUIController:
                     "enabled": notification_enabled,
                     "detail": notification_detail,
                 },
-                "configuration_note": "Launch defaults come from AutoGuard startup configuration; runtime protection switches apply to this app session.",
+                "windows_startup": {
+                    "status": windows_startup.status,
+                    "available": windows_startup.available,
+                    "enabled": windows_startup.enabled,
+                    "detail": windows_startup.detail,
+                },
+                "configuration_note": "Protection switches apply to the current session. Start with Windows is stored as a real per-user Windows startup setting.",
             },
             "advanced": {
                 "database": str(self.services.config.database_path),
@@ -1955,3 +1971,22 @@ class AutoGuardUIController:
             }
 
         self._submit(f"settings-service:{key}", apply, "settings_applied")
+
+    def set_windows_startup(self, enabled: bool) -> None:
+        """Enable or disable AutoGuard at Windows sign-in for the current user."""
+        requested = bool(enabled)
+
+        def apply() -> dict[str, Any]:
+            state = self.windows_startup.set_enabled(requested)
+            return {
+                "service": "windows_startup",
+                "enabled": state.enabled,
+                "title": f"Start with Windows {'on' if state.enabled else 'off'}",
+                "message": (
+                    "AutoGuard will start in the system tray the next time you sign in to Windows."
+                    if state.enabled
+                    else "AutoGuard will no longer start automatically when you sign in to Windows."
+                ),
+            }
+
+        self._submit("settings-windows-startup", apply, "settings_applied")

@@ -52,7 +52,7 @@ class SettingsPage(BasePage):
             self.refresh(preserve_feedback=True)
         elif message.kind == "task_failed":
             task = str(message.payload.get("task", ""))
-            if task == "load-settings" or task.startswith("settings-service:"):
+            if task == "load-settings" or task.startswith("settings-service:") or task == "settings-windows-startup":
                 self._loading = False
                 self._busy_service = None
                 self._error = message.payload.get("error", "The setting could not be applied.")
@@ -185,6 +185,62 @@ class SettingsPage(BasePage):
             command=lambda: self._set_service(service_key, not running),
         )
         button.grid(row=0, column=2, sticky="e")
+
+    def _startup_row(self, parent: ctk.CTkFrame, row: int, state: dict) -> None:
+        """Render the persistent Windows sign-in startup switch."""
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.grid(row=row, column=0, padx=16, pady=5, sticky="ew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        text = ctk.CTkFrame(wrap, fg_color="transparent")
+        text.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            text,
+            text="Start AutoGuard with Windows",
+            font=(theme.FONT, 10, "bold"),
+            text_color=theme.TEXT,
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            text,
+            text=state.get(
+                "detail",
+                "Starts AutoGuard in the system tray when you sign in to Windows.",
+            ),
+            font=(theme.FONT, 9),
+            text_color=theme.TEXT_MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        ).pack(anchor="w", pady=(2, 0))
+
+        available = bool(state.get("available"))
+        enabled = bool(state.get("enabled"))
+        busy = self._busy_service == "windows_startup"
+        status = state.get("status", "Unavailable")
+        status_color = theme.SUCCESS if enabled else (theme.TEXT_MUTED if available else theme.TEXT_DIM)
+        ctk.CTkLabel(
+            wrap,
+            text=status,
+            font=(theme.FONT, 9, "bold"),
+            text_color=status_color,
+            width=112,
+            anchor="e",
+        ).grid(row=0, column=1, padx=(12, 10), sticky="e")
+
+        ctk.CTkButton(
+            wrap,
+            text="Applying…" if busy else ("Turn off" if enabled else "Turn on"),
+            width=88,
+            height=30,
+            fg_color=theme.SURFACE_ALT if enabled else theme.ACCENT_DARK,
+            hover_color=theme.SURFACE_HOVER if enabled else theme.ACCENT_DARK,
+            border_width=1,
+            border_color=theme.BORDER,
+            text_color=theme.TEXT if available else theme.TEXT_DIM,
+            state="disabled" if (not available or busy) else "normal",
+            command=lambda: self._set_windows_startup(not enabled),
+        ).grid(row=0, column=2, sticky="e")
 
     def _info_row(
         self,
@@ -356,9 +412,15 @@ class SettingsPage(BasePage):
             "Application-level locations and configuration behavior supported by the current build.",
         )
         self._info_row(card, 2, "Logs", "Enabled", detail=f"Stored in {data['logs_dir']}")
-        self._info_row(card, 3, "AutoGuard data", data["data_dir"], mono=True)
-        self._info_row(card, 4, "Configuration", "Startup + runtime services", detail=data["configuration_note"])
-        ctk.CTkLabel(card, text="", height=8).grid(row=5, column=0)
+        notifications = data.get("windows_notifications", {})
+        self._info_row(
+            card, 3, "Windows file notifications", notifications.get("status", "Unavailable"),
+            detail=notifications.get("detail", "Notification state is unavailable."),
+        )
+        self._startup_row(card, 4, data.get("windows_startup", {}))
+        self._info_row(card, 5, "AutoGuard data", data["data_dir"], mono=True)
+        self._info_row(card, 6, "Configuration", "Startup + runtime services", detail=data["configuration_note"])
+        ctk.CTkLabel(card, text="", height=8).grid(row=7, column=0)
         return row + 1
 
     def _advanced_section(self, row: int) -> None:
@@ -418,6 +480,13 @@ class SettingsPage(BasePage):
         self._error = None
         self._render()
         self.controller.set_protection_service(service_key, enabled)
+
+    def _set_windows_startup(self, enabled: bool) -> None:
+        self._busy_service = "windows_startup"
+        self._feedback = None
+        self._error = None
+        self._render()
+        self.controller.set_windows_startup(enabled)
 
     def _state_card(self, title: str, message: str, *, tone: str = "info") -> None:
         self._feedback_card(0, title, message, tone=tone)

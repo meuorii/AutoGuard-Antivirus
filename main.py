@@ -28,6 +28,11 @@ def main() -> None:
     parser.add_argument("--no-startup-scan", action="store_true")
     parser.add_argument("--no-windows-notifications", action="store_true")
     parser.add_argument("--no-system-tray", action="store_true")
+    parser.add_argument(
+        "--start-hidden",
+        action="store_true",
+        help="Start AutoGuard in the system tray without showing the main window",
+    )
     args = parser.parse_args()
 
     if args.max_bytes < 0:
@@ -59,7 +64,12 @@ def main() -> None:
             if error.name == "customtkinter":
                 raise SystemExit("customtkinter is required for the desktop UI. Install dependencies with: .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt") from error
             raise
-        launch_desktop(services, args.path, enable_system_tray=not args.no_system_tray)
+        launch_desktop(
+            services,
+            args.path,
+            enable_system_tray=not args.no_system_tray,
+            start_hidden=args.start_hidden,
+        )
 
     try:
         application.start(open_interface)

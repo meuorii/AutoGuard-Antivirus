@@ -76,7 +76,7 @@ class MainWindow(ctk.CTk):
 
     def __init__(
         self, services: AutoGuardServices, *, initial_path: Path | None = None,
-        enable_system_tray: bool = True,
+        enable_system_tray: bool = True, start_hidden: bool = False,
     ):
         super().__init__()
         ctk.set_appearance_mode("dark")
@@ -97,7 +97,9 @@ class MainWindow(ctk.CTk):
         self.controller = AutoGuardUIController(services, self.bus)
         self.notifications = NotificationCenter(self)
         self._closing = False
-        self._hidden_to_tray = False
+        # Windows startup launches with --start-hidden. Only honor it when the
+        # tray is enabled so the application can never become unreachable.
+        self._hidden_to_tray = bool(start_hidden and enable_system_tray)
         self._active_page: str | None = None
         self.tray = SystemTray(services, enabled=enable_system_tray)
 
@@ -119,7 +121,16 @@ class MainWindow(ctk.CTk):
             page.grid(row=0, column=0, sticky="nsew")
 
         self.show_page(DEFAULT_PAGE)
-        self.tray.start()
+        if self._hidden_to_tray:
+            # Withdraw before entering mainloop so sign-in startup does not flash
+            # the full AutoGuard window before the tray icon is ready.
+            self.withdraw()
+        tray_started = self.tray.start()
+        if self._hidden_to_tray and not tray_started:
+            # Fail safe: if the tray backend is unavailable, show the window
+            # instead of leaving a hidden process with no way to open it.
+            self._hidden_to_tray = False
+            self.deiconify()
         self.after(90, self._drain_messages)
         self.after(120, self._drain_tray_actions)
         self.after(700, self._periodic_visible_refresh)
@@ -320,10 +331,15 @@ class MainWindow(ctk.CTk):
 
 def launch_desktop(
     services: AutoGuardServices, initial_path: Path | None = None, *,
-    enable_system_tray: bool = True,
+    enable_system_tray: bool = True, start_hidden: bool = False,
 ) -> None:
     """Create and run the Windows desktop UI on the caller/main thread."""
+    # Must be set before CTk/Tk creates the HWND/taskbar button. This prevents a
+    # source run (python main.py) from inheriting Python's taskbar identity.
     configure_windows_app_identity()
     MainWindow(
-        services, initial_path=initial_path, enable_system_tray=enable_system_tray
+        services,
+        initial_path=initial_path,
+        enable_system_tray=enable_system_tray,
+        start_hidden=start_hidden,
     ).mainloop()
