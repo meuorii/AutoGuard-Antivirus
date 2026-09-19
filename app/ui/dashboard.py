@@ -324,11 +324,20 @@ class DashboardPage(BasePage):
         self._set_status(state["key"], state["title"], state["message"])
         self.quick_scan.configure(state="disabled" if data["scan_running"] else "normal")
 
-        last_scan = data["last_scan"]
-        last_scan_detail = last_scan["detail"]
-        if last_scan.get("when") is not None:
-            last_scan_detail = f"{_format_when(last_scan['when'])} · {last_scan_detail}"
-        self.summaries["Last Scan"].set(last_scan["value"], last_scan_detail)
+        active_scan = data.get("active_scan")
+        if active_scan is not None:
+            checked = int(active_scan.get("files_checked", 0))
+            suffix = "file" if checked == 1 else "files"
+            self.summaries["Last Scan"].set(
+                active_scan.get("label", "Automatic Scan"),
+                f"{checked:,} {suffix} checked · In progress",
+            )
+        else:
+            last_scan = data["last_scan"]
+            last_scan_detail = last_scan["detail"]
+            if last_scan.get("when") is not None:
+                last_scan_detail = f"{_format_when(last_scan['when'])} · {last_scan_detail}"
+            self.summaries["Last Scan"].set(last_scan["value"], last_scan_detail)
 
         review_count = data["threats_needing_review"]
         self.summaries["Threats"].set(

@@ -25,6 +25,8 @@ class ScanPage(BasePage):
         super().__init__(master, controller, **kwargs)
         self.body.grid_columnconfigure(0, weight=1)
         self._scan_running = False
+        self._automatic_scan_running = False
+        self._automatic_scan_key: tuple[str, object] | None = None
         self._result_pending = False
         self._result_visible = False
         self._last_result: dict = {}
@@ -39,6 +41,7 @@ class ScanPage(BasePage):
         self._build_active_view()
         self._build_result_view()
         self._show_idle_view()
+        self.after(350, self._poll_automatic_scan)
 
     def _build_idle_view(self) -> None:
         self.idle_view = ctk.CTkFrame(self.body, fg_color="transparent", corner_radius=0)
@@ -119,6 +122,43 @@ class ScanPage(BasePage):
         else:
             self.controller.navigate_to("threats")
 
+    def _poll_automatic_scan(self) -> None:
+        """Attach the Scan page to startup/scheduled scans already in progress."""
+        try:
+            progress = self.controller.automatic_scan_progress()
+            if not self._scan_running and not self._result_pending and not self._result_visible:
+                if progress is not None:
+                    key = (progress.get("ui_type", "scheduled"), progress.get("started_at"))
+                    if not self._automatic_scan_running or key != self._automatic_scan_key:
+                        self._automatic_scan_running = True
+                        self._automatic_scan_key = key
+                        self.active_scan.start(
+                            progress.get("ui_type", "scheduled"),
+                            progress.get("current_path", ""),
+                            stoppable=False,
+                        )
+                    counts = {
+                        "scanned": progress.get("files_checked", 0),
+                        "skipped": progress.get("skipped", 0),
+                        "suspicious": progress.get("suspicious", 0),
+                        "dangerous": progress.get("dangerous", 0),
+                        "errors": progress.get("errors", 0),
+                    }
+                    self.active_scan.update_progress(
+                        processed=progress.get("processed", 0),
+                        discovered=progress.get("discovered", 0),
+                        counts=counts,
+                        current_path=progress.get("current_path", ""),
+                    )
+                    self._show_active_view()
+                elif self._automatic_scan_running:
+                    self._automatic_scan_running = False
+                    self._automatic_scan_key = None
+                    self.active_scan.end()
+                    self._show_idle_view()
+        finally:
+            self.after(600, self._poll_automatic_scan)
+
     def refresh_from_state(self, reason: str = "") -> None:
         # Scan state is synchronized continuously through scan_* bus messages,
         # including while this page is hidden. No service/database reload needed.
@@ -159,13 +199,15 @@ class ScanPage(BasePage):
     def on_show(self) -> None:
         if self._result_visible:
             self._show_result_view()
-        elif self._scan_running or self._result_pending:
+        elif self._scan_running or self._automatic_scan_running or self._result_pending:
             self._show_active_view()
         else:
             self._show_idle_view()
 
     def handle_message(self, message) -> None:
         if message.kind == "scan_started":
+            self._automatic_scan_running = False
+            self._automatic_scan_key = None
             self._scan_running = True
             self._result_pending = False
             self._result_visible = False

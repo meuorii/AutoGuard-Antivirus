@@ -35,6 +35,13 @@ class TrayStatus:
     full_scan_running: bool
     next_quick_scan: datetime | None
     next_full_scan: datetime | None
+    active_scan_label: str | None = None
+    files_checked: int = 0
+    threats_found: int = 0
+
+    @property
+    def scan_running(self) -> bool:
+        return self.active_scan_label is not None or self.quick_scan_running or self.full_scan_running
 
     @property
     def protection(self) -> str:
@@ -136,6 +143,17 @@ class SystemTray:
             icon = self._icon
         if icon is None:
             return
+        status = self.status_snapshot()
+        try:
+            if status.active_scan_label:
+                icon.title = (
+                    f"AutoGuard — {status.active_scan_label}: "
+                    f"{status.files_checked:,} files checked"
+                )
+            else:
+                icon.title = "AutoGuard"
+        except Exception:
+            pass
         updater = getattr(icon, "update_menu", None)
         if callable(updater):
             try:
@@ -171,6 +189,20 @@ class SystemTray:
             quick_running = False
             full_running = False
 
+        active_label = None
+        files_checked = 0
+        threats_found = 0
+        progress_getter = getattr(self.services.scheduler, "active_scan_progress", None)
+        if callable(progress_getter):
+            try:
+                progress = progress_getter()
+                if progress is not None:
+                    active_label = str(getattr(progress, "label", "Automatic Scan"))
+                    files_checked = int(getattr(progress, "files_checked", 0))
+                    threats_found = int(getattr(progress, "threats_found", 0))
+            except Exception:
+                pass
+
         next_times = {"quick": None, "full": None}
         getter = getattr(self.services.scheduler, "next_run_times", None)
         if callable(getter):
@@ -189,6 +221,9 @@ class SystemTray:
             full_scan_running=full_running,
             next_quick_scan=next_times.get("quick"),
             next_full_scan=next_times.get("full"),
+            active_scan_label=active_label,
+            files_checked=files_checked,
+            threats_found=threats_found,
         )
 
     @staticmethod
@@ -236,11 +271,12 @@ class SystemTray:
         )
         image = tray_image
 
-        def disabled(text_provider: Callable[[], str]):
+        def disabled(text_provider: Callable[[], str], *, visible=True):
             return pystray.MenuItem(
                 lambda _item: text_provider(),
                 lambda _icon, _item: None,
                 enabled=False,
+                visible=visible,
             )
 
         menu = pystray.Menu(
@@ -251,13 +287,24 @@ class SystemTray:
             disabled(lambda: f"USB protection: {self.status_snapshot().usb}"),
             disabled(lambda: f"Scheduled scanning: {self.status_snapshot().scheduled}"),
             pystray.Menu.SEPARATOR,
+            disabled(
+                lambda: (
+                    f"{self.status_snapshot().active_scan_label}: "
+                    f"{self.status_snapshot().files_checked:,} files checked"
+                ),
+                visible=lambda _item: self.status_snapshot().active_scan_label is not None,
+            ),
+            disabled(
+                lambda: f"Threats found: {self.status_snapshot().threats_found:,}",
+                visible=lambda _item: self.status_snapshot().active_scan_label is not None,
+            ),
             disabled(lambda: f"Next Quick Scan: {self._format_next(self.status_snapshot().next_quick_scan)}"),
             disabled(lambda: f"Next Full Scan: {self._format_next(self.status_snapshot().next_full_scan)}"),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                lambda _item: "Quick Scan running…" if self.status_snapshot().quick_scan_running else "Run Quick Scan",
+                lambda _item: "Scan running…" if self.status_snapshot().scan_running else "Run Quick Scan",
                 lambda _icon, _item: self.request(TrayAction.QUICK_SCAN),
-                enabled=lambda _item: not self.status_snapshot().quick_scan_running,
+                enabled=lambda _item: not self.status_snapshot().scan_running,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit AutoGuard", lambda _icon, _item: self.request(TrayAction.EXIT)),

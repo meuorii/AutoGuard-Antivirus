@@ -69,6 +69,7 @@ GLOBAL_STATUS_EVENTS = {
     "recovery_completed", "settings_applied",
 }
 PASSIVE_REFRESH_MS = 10000
+ACTIVE_SCAN_REFRESH_MS = 1000
 
 
 class MainWindow(ctk.CTk):
@@ -270,12 +271,14 @@ class MainWindow(ctk.CTk):
             self._restore_from_tray()
         # When hidden to tray, protection services keep running but there is no
         # reason to repaint hidden Tk pages. The tray reads service health directly.
+        automatic_scan = self.controller.automatic_scan_progress()
         if not self._hidden_to_tray:
             self.controller.refresh_dashboard()
             if self._active_page in PASSIVE_REFRESH_PAGES and self._active_page != "home":
                 self._refresh_visible_page("background-sync")
         self.tray.refresh_menu()
-        self.after(PASSIVE_REFRESH_MS, self._periodic_visible_refresh)
+        refresh_ms = ACTIVE_SCAN_REFRESH_MS if automatic_scan is not None else PASSIVE_REFRESH_MS
+        self.after(refresh_ms, self._periodic_visible_refresh)
 
     def _drain_tray_actions(self) -> None:
         """Handle tray callbacks on Tk's main thread only."""

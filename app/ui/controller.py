@@ -140,10 +140,39 @@ class AutoGuardUIController:
             ScanType.USB: "USB scan",
         }.get(scan_type, "Scan")
 
+    def automatic_scan_progress(self) -> dict[str, Any] | None:
+        """Return a lightweight live snapshot for startup/scheduled scans."""
+        getter = getattr(self.services.scheduler, "active_scan_progress", None)
+        if not callable(getter):
+            return None
+        try:
+            progress = getter()
+        except Exception:
+            return None
+        if progress is None:
+            return None
+        return {
+            "label": str(getattr(progress, "label", "Automatic Scan")),
+            "ui_type": str(getattr(progress, "ui_type", "scheduled")),
+            "scan_type": getattr(getattr(progress, "scan_type", None), "value", "scheduled"),
+            "source": getattr(getattr(progress, "source", None), "value", "scheduled"),
+            "files_checked": int(getattr(progress, "files_checked", 0)),
+            "threats_found": int(getattr(progress, "threats_found", 0)),
+            "discovered": int(getattr(progress, "discovered", 0)),
+            "processed": int(getattr(progress, "processed", 0)),
+            "skipped": int(getattr(progress, "skipped", 0)),
+            "suspicious": int(getattr(progress, "suspicious", 0)),
+            "dangerous": int(getattr(progress, "dangerous", 0)),
+            "errors": int(getattr(progress, "errors", 0)),
+            "current_path": str(getattr(progress, "current_path", "")),
+            "started_at": getattr(progress, "started_at", None),
+        }
+
     def _dashboard_snapshot(self) -> dict[str, Any]:
         file_health = self.services.file_monitor.health() if self.services.file_monitor else None
         usb_health = self.services.usb_monitor.health() if self.services.usb_monitor else None
         scheduler_health = self.services.scheduler.health()
+        automatic_scan = self.automatic_scan_progress()
         quarantine = self.services.quarantine.list_quarantined_items()
         active_incidents = self.services.incidents.get_active_incidents()
         recent = self.services.scanner.history.recent_scans(16)
@@ -206,10 +235,18 @@ class AutoGuardUIController:
                 "message": "AutoGuard found something that needs review.",
             }
         elif scan_running:
+            if automatic_scan is not None:
+                checked = automatic_scan["files_checked"]
+                suffix = "file" if checked == 1 else "files"
+                scan_message = (
+                    f"{automatic_scan['label']} · {checked:,} {suffix} checked"
+                )
+            else:
+                scan_message = "AutoGuard is currently checking your files."
             protection_state = {
                 "key": "scanning",
                 "title": "Scanning",
-                "message": "AutoGuard is currently checking your files.",
+                "message": scan_message,
             }
         else:
             protection_state = {
@@ -245,6 +282,7 @@ class AutoGuardUIController:
             "protection_state": protection_state,
             "protection": protection,
             "scan_running": scan_running,
+            "active_scan": automatic_scan,
             "last_scan": last_scan,
             "threats_needing_review": threats_needing_review,
             "quarantined_count": sum(
@@ -1514,6 +1552,22 @@ class AutoGuardUIController:
     # ---------- Scan work ----------
     def _begin_ui_scan(self, task: str) -> threading.Event | None:
         """Reserve the single active UI scan and return its cancellation event."""
+        try:
+            scheduler_health = self.services.scheduler.health()
+            automatic_running = bool(
+                getattr(scheduler_health, "quick_scan_running", False)
+                or getattr(scheduler_health, "full_scan_running", False)
+            )
+        except Exception:
+            automatic_running = False
+        if automatic_running:
+            self.bus.publish(
+                "scan_rejected",
+                task=task,
+                active_task="automatic-scan",
+                reason="An automatic scan is already running.",
+            )
+            return None
         with self._lock:
             if self._current_scan_task is not None:
                 active = self._current_scan_task

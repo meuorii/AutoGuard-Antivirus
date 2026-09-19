@@ -7,15 +7,16 @@ one was launched outside APScheduler (for example the startup quick scan).
 
 from __future__ import annotations
 
+import inspect
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 from app.hashing import normalize_path
-from app.models import ScanSource, ScanSummary, ScanType
+from app.models import DetectionStatus, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType
 from app.scanner import ScanInterruptedError, Scanner
 
 try:  # Runtime dependency. Tests inject a deterministic APScheduler-compatible fake.
@@ -86,6 +87,34 @@ class SchedulerHealth:
     last_error: str | None
 
 
+@dataclass(frozen=True)
+class AutomaticScanProgress:
+    """Thread-safe presentation snapshot for startup/scheduled scans."""
+
+    kind: ScanKind
+    source: ScanSource
+    scan_type: ScanType
+    label: str
+    ui_type: str
+    started_at: datetime
+    discovered: int = 0
+    processed: int = 0
+    scanned: int = 0
+    skipped: int = 0
+    suspicious: int = 0
+    dangerous: int = 0
+    errors: int = 0
+    current_path: str = ""
+
+    @property
+    def files_checked(self) -> int:
+        return self.scanned
+
+    @property
+    def threats_found(self) -> int:
+        return self.dangerous
+
+
 class ScanExecutionGate:
     """Thread-safe same-kind overlap prevention shared by startup and schedules."""
 
@@ -141,6 +170,14 @@ class ScanScheduler:
         self._running = False
         self._completed: list[ScanBatchResult] = []
         self._last_error: str | None = None
+        self._active_progress: dict[ScanKind, AutomaticScanProgress] = {}
+        try:
+            scan_parameters = inspect.signature(self.scanner.scan).parameters
+            self._scanner_supports_progress = (
+                "on_result" in scan_parameters and "on_discovered" in scan_parameters
+            )
+        except (TypeError, ValueError):
+            self._scanner_supports_progress = False
 
     @staticmethod
     def _normalize_targets(paths: Iterable[str | Path]) -> tuple[Path, ...]:
@@ -214,6 +251,92 @@ class ScanScheduler:
                     worker.join(timeout=timeout)
         return self.health()
 
+    @staticmethod
+    def _automatic_scan_identity(
+        kind: ScanKind, source: ScanSource
+    ) -> tuple[str, str]:
+        if source is ScanSource.STARTUP:
+            return "Startup Quick Scan", "startup"
+        if kind is ScanKind.FULL:
+            return "Scheduled Full Scan", "scheduled_full"
+        return "Scheduled Quick Scan", "scheduled_quick"
+
+    def _begin_progress(
+        self, kind: ScanKind, source: ScanSource, scan_type: ScanType
+    ) -> None:
+        label, ui_type = self._automatic_scan_identity(kind, source)
+        snapshot = AutomaticScanProgress(
+            kind=kind,
+            source=source,
+            scan_type=scan_type,
+            label=label,
+            ui_type=ui_type,
+            started_at=datetime.now(timezone.utc),
+        )
+        with self._lock:
+            self._active_progress[kind] = snapshot
+
+    def _clear_progress(self, kind: ScanKind) -> None:
+        with self._lock:
+            self._active_progress.pop(kind, None)
+
+    def _progress_discovered(self, kind: ScanKind, path: str, entry_kind: str) -> None:
+        with self._lock:
+            current = self._active_progress.get(kind)
+            if current is None:
+                return
+            self._active_progress[kind] = replace(
+                current,
+                discovered=current.discovered + (1 if entry_kind == "file" else 0),
+                current_path=str(path),
+            )
+
+    def _progress_result(self, kind: ScanKind, result: ScanResult) -> None:
+        with self._lock:
+            current = self._active_progress.get(kind)
+            if current is None:
+                return
+            scanned = current.scanned
+            skipped = current.skipped
+            errors = current.errors
+            suspicious = current.suspicious
+            dangerous = current.dangerous
+            if result.status is ScanStatus.SCANNED:
+                scanned += 1
+            elif result.status is ScanStatus.ERROR:
+                errors += 1
+            else:
+                skipped += 1
+            detection = result.detection.status if result.detection else None
+            if detection is DetectionStatus.LOW_CONFIDENCE:
+                suspicious += 1
+            elif detection is DetectionStatus.HIGH_CONFIDENCE:
+                dangerous += 1
+            self._active_progress[kind] = replace(
+                current,
+                processed=current.processed + 1,
+                scanned=scanned,
+                skipped=skipped,
+                suspicious=suspicious,
+                dangerous=dangerous,
+                errors=errors,
+                current_path=str(result.path),
+            )
+
+    def active_scan_progress(self) -> AutomaticScanProgress | None:
+        """Return the most recently started automatic scan, if one is active."""
+        with self._lock:
+            values = tuple(self._active_progress.values())
+        if not values:
+            return None
+        return max(values, key=lambda item: item.started_at)
+
+    def active_scan_progresses(self) -> tuple[AutomaticScanProgress, ...]:
+        with self._lock:
+            return tuple(
+                sorted(self._active_progress.values(), key=lambda item: item.started_at)
+            )
+
     def dispatch_startup_scan(self) -> ScanDispatch:
         """Launch the startup quick scan using STARTUP history metadata."""
         return self._dispatch(
@@ -255,11 +378,13 @@ class ScanScheduler:
     ) -> ScanDispatch:
         if not self.gate.try_acquire(kind):
             return ScanDispatch(DispatchStatus.SKIPPED_ALREADY_RUNNING, kind)
+        self._begin_progress(kind, source, scan_type)
 
         def runner() -> None:
             try:
                 self._run_batch(kind, targets, source=source, scan_type=scan_type)
             finally:
+                self._clear_progress(kind)
                 self.gate.release(kind)
                 with self._lock:
                     self._workers.discard(threading.current_thread())
@@ -272,6 +397,7 @@ class ScanScheduler:
         except Exception:
             with self._lock:
                 self._workers.discard(thread)
+            self._clear_progress(kind)
             self.gate.release(kind)
             raise
         return ScanDispatch(DispatchStatus.DISPATCHED, kind, thread.name)
@@ -297,14 +423,20 @@ class ScanScheduler:
                 skipped.append(str(target))
                 continue
             try:
-                summaries.append(
-                    self.scanner.scan(
-                        target,
-                        source,
-                        scan_type=scan_type,
-                        interrupt_check=self._shutdown_event.is_set,
+                scan_kwargs = {
+                    "scan_type": scan_type,
+                    "interrupt_check": self._shutdown_event.is_set,
+                }
+                if self._scanner_supports_progress:
+                    scan_kwargs.update(
+                        on_discovered=lambda path, entry_kind, active_kind=kind: self._progress_discovered(
+                            active_kind, path, entry_kind
+                        ),
+                        on_result=lambda result, active_kind=kind: self._progress_result(
+                            active_kind, result
+                        ),
                     )
-                )
+                summaries.append(self.scanner.scan(target, source, **scan_kwargs))
             except ScanInterruptedError as error:
                 interrupted = True
                 errors.append(f"{target}: {error}")
