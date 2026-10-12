@@ -1005,14 +1005,29 @@ class AutoGuardUIController:
         successful_quarantine = tuple(
             item for item in quarantine_items if item.state is QuarantineState.QUARANTINED
         )
-        failed_quarantine = tuple(
-            item for item in quarantine_items if item.state is QuarantineState.FAILED
+        # delete_quarantine_object() records a user deletion as state FAILED with a
+        # specific failure_reason, so it must not be reported as a failed quarantine.
+        deleted_quarantine = tuple(
+            item for item in quarantine_items
+            if item.state is QuarantineState.FAILED
+            and str(item.failure_reason or "").startswith("Quarantine object permanently deleted")
         )
-        if successful_quarantine:
+        failed_quarantine = tuple(
+            item for item in quarantine_items
+            if item.state is QuarantineState.FAILED and item not in deleted_quarantine
+        )
+        if not successful_quarantine and deleted_quarantine and not failed_quarantine:
+            action_text = (
+                "AutoGuard isolated this threat in quarantine. The quarantined copy was "
+                "later permanently deleted at your request."
+            )
+        elif successful_quarantine:
             count = len(successful_quarantine)
             action_text = (
                 f"AutoGuard isolated {count:,} related {'file' if count == 1 else 'files'} in quarantine."
             )
+            if deleted_quarantine:
+                action_text += " Another quarantined copy was permanently deleted at your request."
             if failed_quarantine:
                 action_text += " One or more additional quarantine attempts did not complete successfully."
         elif failed_quarantine:
