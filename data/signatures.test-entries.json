@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "signatures": [
+    {
+      "name": "AutoGuard Simulated Test AG-TEST-001",
+      "sha256": "43380901fc629c1dbe8b8c531ede3797bf2e2ca98c74e707e17fdde5fcd9d988",
+      "kind": "autoguard_test",
+      "description": "Harmless local fixture used to verify AutoGuard signature detection; this is not real malware."
+    },
+    {
+      "name": "AutoGuard Simulated Test AG-TEST-002",
+      "sha256": "314b6eac55201bee81bf050ca8d09c99dbc0387d61b42af4aa87fa640730813a",
+      "kind": "autoguard_test",
+      "description": "Harmless local fixture used to verify AutoGuard signature detection; this is not real malware."
+    },
+    {
+      "name": "AutoGuard Simulated Test AG-TEST-003",
+      "sha256": "630493e71139b4d4c3ac50b52b0f967b4d338ee7c2950d64ff8ff147d7f7442f",
+      "kind": "autoguard_test",
+      "description": "Harmless local fixture used to verify AutoGuard signature detection; this is not real malware."
+    }
+  ]
+}
