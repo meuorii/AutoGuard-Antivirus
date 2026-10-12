@@ -1140,6 +1140,7 @@ class AutoGuardUIController:
             "locations": locations,
             "timeline": timeline,
             "technical_details": technical,
+            "can_resolve": incident.status is not IncidentStatus.RESOLVED,
         }
 
     def load_incidents(self) -> None:
@@ -1605,6 +1606,16 @@ class AutoGuardUIController:
             task = self._current_scan_task
             event = self._scan_cancel_events.get(task) if task is not None else None
         if task is None or event is None:
+            # No UI-launched scan: try a running startup/scheduled scan instead.
+            request = getattr(getattr(self.services, "scheduler", None), "request_stop_active_scans", None)
+            if callable(request):
+                try:
+                    stopped = bool(request())
+                except Exception:
+                    stopped = False
+                if stopped:
+                    self.bus.publish("scan_stop_requested", task="automatic-scan")
+                    return True
             return False
         event.set()
         self.bus.publish("scan_stop_requested", task=task)
@@ -1847,6 +1858,27 @@ class AutoGuardUIController:
                 ),
             }
         self._submit(f"delete-quarantine:{quarantine_id}", delete, "quarantine_deleted")
+
+    def resolve_threat(self, threat_ref: str) -> None:
+        """Let the user close an incident. History, events and quarantine records are kept."""
+        ref = str(threat_ref or "").strip()
+        if not ref:
+            return
+
+        def resolve() -> dict[str, Any]:
+            details = self.services.incidents.get_incident(ref)
+            if details is None:
+                raise KeyError("The selected threat is no longer available.")
+            self.services.incidents.change_status(
+                ref, IncidentStatus.RESOLVED, reason="Marked as resolved by the user."
+            )
+            return {
+                "threat_ref": ref,
+                "title": "Threat marked as resolved",
+                "message": "The incident was closed. Its history was kept.",
+            }
+
+        self._submit(f"resolve-threat:{ref}", resolve, "threat_resolved")
 
     def verify_incident_cleanup(self, incident_id: str) -> None:
         self._submit(

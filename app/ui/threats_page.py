@@ -9,7 +9,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
-from app.ui.components import SectionHeader, StateCard, StatusBadge
+from app.ui.components import ConfirmDialog, SectionHeader, StateCard, StatusBadge
 from app.ui.threat_details_page import ThreatDetailsView
 
 
@@ -70,6 +70,9 @@ class ThreatsPage(BasePage):
                 if was_loading or result != self._detail_data:
                     self._detail_data = result
                     self._render_details(result)
+        elif message.kind == "threat_resolved":
+            if self._detail_ref and message.payload.get("result", {}).get("threat_ref") == self._detail_ref:
+                self.controller.close_threat_details()
         elif message.kind == "threat_details_closed":
             self._detail_ref = None
             self._detail_data = None
@@ -144,7 +147,20 @@ class ThreatsPage(BasePage):
             self.body,
             data or {},
             on_back=self.controller.close_threat_details,
+            on_resolve=lambda: self._confirm_resolve(self._detail_ref),
         ).grid(row=0, column=0, sticky="ew")
+
+    def _confirm_resolve(self, threat_ref) -> None:
+        if not threat_ref:
+            return
+        ConfirmDialog(
+            self.winfo_toplevel(),
+            "Mark threat as resolved?",
+            "This closes the incident and moves it to Resolved. Its history is kept. "
+            "If the same content is detected again, AutoGuard will open a new incident.",
+            confirm_text="Mark as resolved",
+            on_confirm=lambda: self.controller.resolve_threat(threat_ref),
+        )
 
     def _render_loading(self) -> None:
         self.clear_body()

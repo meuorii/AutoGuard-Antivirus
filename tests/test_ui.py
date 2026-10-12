@@ -2005,7 +2005,7 @@ def test_scan_page_polls_existing_automatic_scan_progress():
     controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
     assert "def automatic_scan_progress" in controller
     assert "def _poll_automatic_scan" in scan_page
-    assert "stoppable=False" in scan_page
+    assert "stoppable=True" in scan_page
     assert 'progress.get("files_checked", 0)' in scan_page
 
 

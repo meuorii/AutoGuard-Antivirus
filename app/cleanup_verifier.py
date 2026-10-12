@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 from uuid import uuid4
 
 from app.database import Database
-from app.hashing import hash_file, is_link_or_reparse, normalize_path
+from app.hashing import hash_file, is_link_or_reparse, normalize_path, raise_if_interrupted, single_expected_size
 from app.incidents import IncidentEventType, IncidentService, IncidentStatus
 from app.matching_cleanup import default_monitored_locations
 from app.models import ScanSource
@@ -34,7 +34,9 @@ class CleanupVerifier:
         self._quarantine_dir = normalize_path(quarantine.quarantine_dir)
         self._database_files = {normalize_path(str(database.path) + s) for s in ("", "-wal", "-shm", "-journal")}
 
-    def verify_incident(self, incident_id: str) -> CleanupVerificationResult:
+    def verify_incident(
+        self, incident_id: str, *, interrupt_check: Callable[[], bool] | None = None
+    ) -> CleanupVerificationResult:
         if (details := self.incidents.get_incident(incident_id)) is None: raise KeyError(f"Unknown threat incident: {incident_id}")
         if details.incident.status is IncidentStatus.RESOLVED: raise ValueError("Cannot verify cleanup for a RESOLVED incident.")
         expected_sha256, verification_id, started, roots = details.incident.sha256, str(uuid4()), datetime.now(timezone.utc), self._search_locations()
@@ -50,10 +52,15 @@ class CleanupVerifier:
             if integrity.verified and integrity.actual_sha256 == expected_sha256: verified_quarantine_objects += 1
             else: quarantine_integrity_failed = True; errors.append(VerificationIssue(item.stored_path, integrity.error or f"Quarantine object {item.quarantine_id} failed hash verification."))
 
+        expected_size = single_expected_size(quarantine_items)
         known_paths = [Path(i.path) for i in details.files] + [Path(i.original_path) for i in quarantine_items]
-        for p in known_paths: self._check_candidate(p, expected_sha256, checked_paths, remaining, inaccessible, errors)
+        for p in known_paths:
+            raise_if_interrupted(interrupt_check, "cleanup verification")
+            self._check_candidate(p, expected_sha256, checked_paths, remaining, inaccessible, errors, expected_size)
         for r in roots:
-            for p in self._walk_files(r, inaccessible, errors): self._check_candidate(p, expected_sha256, checked_paths, remaining, inaccessible, errors)
+            for p in self._walk_files(r, inaccessible, errors):
+                raise_if_interrupted(interrupt_check, "cleanup verification")
+                self._check_candidate(p, expected_sha256, checked_paths, remaining, inaccessible, errors, expected_size)
 
         status = VerificationStatus.FAILED if (quarantined_copies == 0 or quarantine_integrity_failed) else (VerificationStatus.PARTIAL if (remaining or inaccessible or errors) else VerificationStatus.VERIFIED)
         result = CleanupVerificationResult(verification_id, incident_id, expected_sha256, status, started, datetime.now(timezone.utc), locations_searched, quarantined_copies, verified_quarantine_objects, len(remaining), len(inaccessible), len(errors), tuple(sorted(remaining)), tuple(inaccessible), tuple(errors))
@@ -68,7 +75,7 @@ class CleanupVerifier:
         with self.database.connection() as conn: rows = conn.execute("SELECT * FROM cleanup_verifications WHERE incident_id = ? ORDER BY started_at, rowid", (incident_id,)).fetchall()
         return [_result(r) for r in rows]
 
-    def _check_candidate(self, path: str | Path, expected_sha256: str, checked_paths: set[str], remaining: set[str], inaccessible: list[VerificationIssue], errors: list[VerificationIssue]) -> None:
+    def _check_candidate(self, path: str | Path, expected_sha256: str, checked_paths: set[str], remaining: set[str], inaccessible: list[VerificationIssue], errors: list[VerificationIssue], expected_size: int | None = None) -> None:
         normalized, key = normalize_path(path), str(normalize_path(path))
         if key in checked_paths or self._excluded(normalized): return
         checked_paths.add(key)
@@ -77,6 +84,7 @@ class CleanupVerifier:
         except PermissionError as e: inaccessible.append(VerificationIssue(key, f"Permission denied while checking location: {e}")); return
         except OSError as e: inaccessible.append(VerificationIssue(key, f"Could not inspect location: {type(e).__name__}: {e}")); return
         if is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode): return
+        if expected_size is not None and info.st_size != expected_size: return
         try:
             if hash_file(normalized).sha256 == expected_sha256: remaining.add(key)
         except PermissionError as e: inaccessible.append(VerificationIssue(key, f"Permission denied while hashing: {e}"))

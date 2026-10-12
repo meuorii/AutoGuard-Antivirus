@@ -31,10 +31,11 @@ _LOCATION_STYLE = {
 class ThreatDetailsView(ctk.CTkFrame):
     """Reusable Threat Details presentation with Locations and Timeline."""
 
-    def __init__(self, master, data: dict, *, on_back, **kwargs):
+    def __init__(self, master, data: dict, *, on_back, on_resolve=None, **kwargs):
         super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
         self._technical_open = False
         self._data = data
+        self._on_resolve = on_resolve
         self.grid_columnconfigure(0, weight=1)
         self._build(on_back)
 
@@ -75,13 +76,27 @@ class ThreatDetailsView(ctk.CTkFrame):
             self._data.get("status_key", "attention"),
         ).grid(row=0, column=1, padx=(0, 18), pady=(17, 4), sticky="e")
 
+        can_resolve = bool(self._data.get("can_resolve")) and self._on_resolve is not None
         ctk.CTkLabel(
             header,
             text=f"Last observed {self._data.get('observed', 'time unavailable')}",
             font=(theme.FONT, 10),
             text_color=theme.TEXT_MUTED,
             anchor="w",
-        ).grid(row=1, column=0, columnspan=2, padx=18, pady=(0, 16), sticky="ew")
+        ).grid(row=1, column=0, columnspan=1 if can_resolve else 2, padx=18, pady=(0, 16), sticky="ew")
+        if can_resolve:
+            ctk.CTkButton(
+                header,
+                text="Mark as resolved",
+                width=130,
+                height=30,
+                fg_color=theme.SURFACE_ALT,
+                hover_color=theme.SURFACE_HOVER,
+                text_color=theme.TEXT,
+                border_width=1,
+                border_color=theme.BORDER,
+                command=self._on_resolve,
+            ).grid(row=1, column=1, padx=(0, 18), pady=(0, 16), sticky="e")
 
         self._build_what_happened(row=2)
         self._build_locations(row=3)

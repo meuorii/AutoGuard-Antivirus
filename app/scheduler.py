@@ -167,6 +167,7 @@ class ScanScheduler:
         self._lock = threading.RLock()
         self._workers: set[threading.Thread] = set()
         self._shutdown_event = threading.Event()
+        self._user_stop_events: dict[ScanKind, threading.Event] = {}
         self._running = False
         self._completed: list[ScanBatchResult] = []
         self._last_error: str | None = None
@@ -378,6 +379,8 @@ class ScanScheduler:
     ) -> ScanDispatch:
         if not self.gate.try_acquire(kind):
             return ScanDispatch(DispatchStatus.SKIPPED_ALREADY_RUNNING, kind)
+        with self._lock:
+            self._user_stop_events[kind] = threading.Event()
         self._begin_progress(kind, source, scan_type)
 
         def runner() -> None:
@@ -402,6 +405,18 @@ class ScanScheduler:
             raise
         return ScanDispatch(DispatchStatus.DISPATCHED, kind, thread.name)
 
+    def request_stop_active_scans(self) -> bool:
+        """Ask running startup/scheduled scans to stop safely (user-requested).
+
+        Uses the scanner's cooperative interruption, so the session is persisted as
+        incomplete exactly like a UI-launched Stop Scan. Returns True if a scan was running.
+        """
+        with self._lock:
+            active = [kind for kind in self._active_progress if kind in self._user_stop_events]
+            for kind in active:
+                self._user_stop_events[kind].set()
+        return bool(active)
+
     def _run_batch(
         self,
         kind: ScanKind,
@@ -415,8 +430,14 @@ class ScanScheduler:
         skipped: list[str] = []
         errors: list[str] = []
         interrupted = False
+        with self._lock:
+            user_stop = self._user_stop_events.setdefault(kind, threading.Event())
+
+        def should_stop() -> bool:
+            return self._shutdown_event.is_set() or user_stop.is_set()
+
         for target in targets:
-            if self._shutdown_event.is_set():
+            if should_stop():
                 interrupted = True
                 break
             if not target.exists():
@@ -425,7 +446,7 @@ class ScanScheduler:
             try:
                 scan_kwargs = {
                     "scan_type": scan_type,
-                    "interrupt_check": self._shutdown_event.is_set,
+                    "interrupt_check": should_stop,
                 }
                 if self._scanner_supports_progress:
                     scan_kwargs.update(
@@ -439,7 +460,8 @@ class ScanScheduler:
                 summaries.append(self.scanner.scan(target, source, **scan_kwargs))
             except ScanInterruptedError as error:
                 interrupted = True
-                errors.append(f"{target}: {error}")
+                if not (user_stop.is_set() and not self._shutdown_event.is_set()):
+                    errors.append(f"{target}: {error}")
                 break
             except Exception as error:
                 errors.append(f"{target}: {type(error).__name__}: {error}")

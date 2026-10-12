@@ -1,6 +1,7 @@
 """Synchronous file/directory scanning, independent of presentation and actions."""
 
 import errno
+import inspect
 import os
 import stat
 import threading
@@ -13,6 +14,7 @@ from app.cleanup_verifier import CleanupVerificationResult, CleanupVerifier
 from app.detection_rules import SCRIPT_EXTENSIONS
 from app.detector import SCRIPT_PREVIEW_BYTES, Detector
 from app.hashing import (
+    OperationInterrupted,
     FileTooLargeError,
     UnsupportedFileError,
     inspect_file,
@@ -218,23 +220,43 @@ class Scanner:
             if sha256 in active_by_hash
         ]
 
-        if self.matching_cleanup is not None:
-            for incident_id in incident_ids:
-                cleanup_results.append(
-                    self.matching_cleanup.cleanup_incident(incident_id)
-                )
-        self.last_matching_cleanup_results = tuple(cleanup_results)
+        try:
+            if self.matching_cleanup is not None:
+                for incident_id in incident_ids:
+                    cleanup_results.append(
+                        self._call_with_interrupt(
+                            self.matching_cleanup.cleanup_incident, incident_id, interrupt_check
+                        )
+                    )
+            self.last_matching_cleanup_results = tuple(cleanup_results)
 
-        # Phase 8 verifies containment only after quarantine and any configured
-        # matching-copy cleanup have finished. The verifier, not quarantine, is
-        # the authority that may move an incident to CONTAINED.
-        if self.cleanup_verifier is not None:
-            for incident_id in incident_ids:
-                verification_results.append(
-                    self.cleanup_verifier.verify_incident(incident_id)
-                )
+            # Phase 8 verifies containment only after quarantine and any configured
+            # matching-copy cleanup have finished. The verifier, not quarantine, is
+            # the authority that may move an incident to CONTAINED.
+            if self.cleanup_verifier is not None:
+                for incident_id in incident_ids:
+                    verification_results.append(
+                        self._call_with_interrupt(
+                            self.cleanup_verifier.verify_incident, incident_id, interrupt_check
+                        )
+                    )
+        except OperationInterrupted as error:
+            log.warning("Scan stopped during post-scan cleanup session=%s root=%s: %s", session.id, root, error)
+            raise ScanInterruptedError(str(error), session.id) from error
+        self.last_matching_cleanup_results = tuple(cleanup_results)
         self.last_cleanup_verification_results = tuple(verification_results)
         summary = ScanSummary(tuple(results), session.id); log.info("Scan completed session=%s root=%s counts=%s", session.id, root, summary.counts); return summary
+
+    @staticmethod
+    def _call_with_interrupt(function, incident_id, interrupt_check):
+        """Pass the stop check to cleanup steps that support it (fakes may not)."""
+        try:
+            supports = "interrupt_check" in inspect.signature(function).parameters
+        except (TypeError, ValueError):
+            supports = False
+        if supports and interrupt_check is not None:
+            return function(incident_id, interrupt_check=interrupt_check)
+        return function(incident_id)
 
     def count_scan_entries(
         self, path: str | Path, *, mode: ScanMode = "auto",

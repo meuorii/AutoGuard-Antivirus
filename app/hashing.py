@@ -56,3 +56,26 @@ def inspect_file(path: str | Path, chunk_size: int = HASH_CHUNK_SIZE, *, preview
     validate(current)
     if _identity(before) != _identity(after) or _identity(after) != _identity(current) or size_bytes != after.st_size: raise FileChangedError(f"File changed while hashing: {normalized}")
     return FileInspection(FileFingerprint(digest.hexdigest(), str(normalized), size_bytes), bytes(preview))
+
+
+class OperationInterrupted(RuntimeError):
+    """A long cleanup/verification step was stopped cooperatively by the user."""
+
+
+def raise_if_interrupted(interrupt_check, where: str = "operation") -> None:
+    if interrupt_check is not None and interrupt_check():
+        raise OperationInterrupted(f"Stopped during {where}.")
+
+
+def single_expected_size(items) -> int | None:
+    """Return the one exact size recorded for a threat's quarantine items, else None.
+
+    Equal SHA-256 implies equal size, so files of a different size can be skipped
+    without hashing. If sizes are missing or disagree, no size prefilter is used.
+    """
+    sizes = set()
+    for item in items:
+        for value in (getattr(item, "original_size", None), getattr(item, "verified_size", None)):
+            if value is not None:
+                sizes.add(int(value))
+    return next(iter(sizes)) if len(sizes) == 1 else None

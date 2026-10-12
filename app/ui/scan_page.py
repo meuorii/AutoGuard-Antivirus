@@ -135,7 +135,7 @@ class ScanPage(BasePage):
                         self.active_scan.start(
                             progress.get("ui_type", "scheduled"),
                             progress.get("current_path", ""),
-                            stoppable=False,
+                            stoppable=True,
                         )
                     counts = {
                         "scanned": progress.get("files_checked", 0),

@@ -4,10 +4,10 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from app.database import Database
-from app.hashing import hash_file, is_link_or_reparse, normalize_path
+from app.hashing import hash_file, is_link_or_reparse, normalize_path, raise_if_interrupted, single_expected_size
 from app.incidents import IncidentEventType, IncidentService, IncidentStatus
 from app.models import ScanSource
 from app.quarantine import QuarantineService, QuarantineState
@@ -52,7 +52,9 @@ class MatchingCopyCleanup:
         self._database_files = {normalize_path(str(database.path) + suffix) for suffix in ("", "-wal", "-shm", "-journal")}
         self._quarantine_dir = normalize_path(quarantine.quarantine_dir)
 
-    def cleanup_incident(self, incident_id: str) -> MatchingCleanupResult:
+    def cleanup_incident(
+        self, incident_id: str, *, interrupt_check: Callable[[], bool] | None = None
+    ) -> MatchingCleanupResult:
         """Search monitored scope, verify exact hashes, and quarantine exact matches."""
         details = self.incidents.get_incident(incident_id)
         if details is None: raise KeyError(f"Unknown threat incident: {incident_id}")
@@ -83,6 +85,10 @@ class MatchingCopyCleanup:
                     detection_reason="A verified quarantine record already contains this matching location.",
                 )
 
+        expected_size = single_expected_size(
+            item for item in self.quarantine.list_quarantined_items()
+            if item.incident_id == incident_id and item.sha256 == expected_sha256
+        )
         candidates, queued = [], set()
         for known in [Path(item.path) for item in details.files] + [Path(item.path) for item in self.threat_trail.get_observations(expected_sha256)]:
             normalized = normalize_path(known)
@@ -93,6 +99,7 @@ class MatchingCopyCleanup:
 
         for root in roots:
             for path in self._walk_files(root, inaccessible, failures):
+                raise_if_interrupted(interrupt_check, "matching-copy search")
                 key = str(path)
                 if key in queued or key in contained_paths: continue
                 queued.add(key); candidates.append(path)
@@ -101,7 +108,13 @@ class MatchingCopyCleanup:
 
         for path in candidates:
             if self._excluded(path): continue
+            raise_if_interrupted(interrupt_check, "matching-copy cleanup")
             candidates_examined += 1
+            if expected_size is not None:
+                try:
+                    if path.stat().st_size != expected_size: continue
+                except OSError:
+                    pass  # let hashing below record the real access error
             try:
                 fingerprint = hash_file(path)
             except PermissionError as error:

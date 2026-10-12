@@ -58,6 +58,7 @@ STATE_CHANGE_TARGETS = {
     "scan_batch_completed": {"home", "scan", "threats", "quarantine", "activity"},
     "scan_result_ready": {"home", "scan", "threats", "quarantine", "activity"},
     "incident_verified": {"home", "threats", "activity"},
+    "threat_resolved": {"home", "threats", "activity"},
     "quarantine_verified": {"quarantine"},
     "quarantine_deleted": {"home", "threats", "quarantine", "activity"},
     "recovery_completed": {"home", "threats", "quarantine", "activity"},
@@ -66,7 +67,7 @@ STATE_CHANGE_TARGETS = {
 PASSIVE_REFRESH_PAGES = {"home", "threats", "quarantine", "activity", "settings"}
 GLOBAL_STATUS_EVENTS = {
     "scan_started", "scan_stopped", "scan_completed", "scan_batch_completed",
-    "scan_result_ready", "incident_verified", "quarantine_deleted",
+    "scan_result_ready", "incident_verified", "threat_resolved", "quarantine_deleted",
     "recovery_completed", "settings_applied",
 }
 PASSIVE_REFRESH_MS = 10000
@@ -242,6 +243,13 @@ class MainWindow(ctk.CTk):
                     result.get("title", "Restore finished"),
                     result.get("message", "The restore operation finished."),
                     "verified" if tone == "success" else ("failed" if tone == "error" else "warning"),
+                )
+            elif message.kind == "threat_resolved":
+                result = message.payload.get("result", {})
+                self.notifications.show(
+                    result.get("title", "Threat resolved"),
+                    result.get("message", "The incident was closed."),
+                    "verified",
                 )
             elif message.kind == "quarantine_deleted":
                 result = message.payload.get("result", {})
