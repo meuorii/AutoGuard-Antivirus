@@ -15,6 +15,7 @@ from app.resources import (
     autoguard_logo_path,
     configure_windows_app_identity,
 )
+from app.logging_config import application_logger
 from app.startup import AutoGuardServices
 from app.system_tray import SystemTray, TrayAction
 from app.ui import theme
@@ -179,7 +180,19 @@ class MainWindow(ctk.CTk):
     def _drain_messages(self) -> None:
         if self._closing:
             return
-        for message in self.bus.drain():
+        try:
+            for message in self.bus.drain():
+                try:
+                    self._handle_message(message)
+                except Exception:
+                    # One bad message must never kill the UI message pump.
+                    application_logger().exception("UI message %r failed", message.kind)
+        finally:
+            if not self._closing:
+                self.after(90, self._drain_messages)
+
+    def _handle_message(self, message) -> None:
+        if True:
             if message.kind == "navigate":
                 self.show_page(message.payload.get("page", ""))
             elif message.kind == "dashboard_data":
@@ -205,7 +218,9 @@ class MainWindow(ctk.CTk):
                     page.handle_message(message)
                 except Exception:
                     # A single page refresh must not break the UI message pump.
-                    pass
+                    application_logger().exception(
+                        "Page %s failed handling %r", type(page).__name__, message.kind
+                    )
             if message.kind == "task_failed":
                 self.notifications.show(
                     "Operation failed",
@@ -245,7 +260,6 @@ class MainWindow(ctk.CTk):
             targets = STATE_CHANGE_TARGETS.get(message.kind, set())
             if self._active_page in targets:
                 self._refresh_visible_page(message.kind)
-        self.after(90, self._drain_messages)
 
     def _refresh_visible_page(self, reason: str = "state-sync") -> None:
         page = self.pages.get(self._active_page or "")
@@ -255,7 +269,7 @@ class MainWindow(ctk.CTk):
             page.refresh_from_state(reason)
         except Exception:
             # A presentation refresh must never interrupt the global message pump.
-            pass
+            application_logger().exception("Refresh failed for page %r", self._active_page)
 
     def _periodic_visible_refresh(self) -> None:
         """Keep the visible read-only page current with background monitor data.
