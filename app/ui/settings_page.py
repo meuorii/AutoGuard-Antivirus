@@ -15,7 +15,7 @@ from app.ui.preferences import TEXT_SIZES, save_text_size
 
 class SettingsPage(BasePage):
     title = "Settings"
-    subtitle = "Protection, scanning, quarantine, and application configuration"
+    subtitle = "Customize AutoGuard's protection and application preferences."
 
     def __init__(self, master, controller, **kwargs):
         super().__init__(master, controller, **kwargs)

@@ -221,8 +221,11 @@ def test_automatic_scan_exposes_live_files_checked_progress(tmp_path):
 
         def scan(
             self, path, source, *, scan_type, interrupt_check=None,
-            on_result=None, on_discovered=None,
+            on_result=None, on_discovered=None, on_phase=None,
         ):
+            if on_phase:
+                on_phase("discovering", None)
+                on_phase("scanning", 3)
             for index in range(3):
                 item = Path(path) / f"file-{index}.txt"
                 if on_discovered is not None:
@@ -247,6 +250,8 @@ def test_automatic_scan_exposes_live_files_checked_progress(tmp_path):
     assert progress.files_checked == 2
     assert progress.processed == 2
     assert progress.discovered == 2
+    assert progress.phase == "scanning"
+    assert progress.total == 3
     assert "file-1.txt" in progress.current_path
 
     scanner.release.set()

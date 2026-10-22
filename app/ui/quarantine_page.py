@@ -5,7 +5,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
-from app.ui.components import ConfirmDialog, StateCard, StatusBadge
+from app.ui.components import ConfirmDialog, StateCard, StatusBadge, SummaryStatCard, compact_text
 from app.ui.quarantine_details_page import QuarantineDetailsView
 
 
@@ -15,7 +15,7 @@ LOAD_TIMEOUT_MS = 20000
 
 class QuarantinePage(BasePage):
     title = "Quarantine"
-    subtitle = "Files AutoGuard has isolated from their original locations"
+    subtitle = "Manage isolated files and review quarantine activity."
 
     def __init__(self, master, controller, **kwargs):
         super().__init__(master, controller, **kwargs)
@@ -289,11 +289,21 @@ class QuarantinePage(BasePage):
         self._controls = []
         self._pager_buttons = None
         row = self._notice_widget(0)
+        count = int(data.get("isolated_count", len(items)))
+        summary = ctk.CTkFrame(self.body, fg_color="transparent")
+        summary.grid(row=row, column=0, padx=8, pady=(0, 8), sticky="ew")
+        summary.grid_columnconfigure((0, 1, 2), weight=1, uniform="quarantine-summary")
+        SummaryStatCard(summary, "Total Quarantined", count,
+                        "Files currently isolated", tone="info").grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        SummaryStatCard(summary, "Integrity Verified", data.get("verified_count", 0),
+                        "Stored content checks passed", tone="success").grid(row=0, column=1, padx=6, sticky="ew")
+        SummaryStatCard(summary, "Verification Issues", data.get("verification_issues", 0),
+                        "Require attention", tone="danger" if data.get("verification_issues", 0) else "neutral").grid(row=0, column=2, padx=(6, 0), sticky="ew")
+        row += 1
         toolbar = ctk.CTkFrame(self.body, fg_color="transparent", height=1)
         toolbar.grid(row=row, column=0, padx=8, pady=8, sticky="ew")
         toolbar.grid_columnconfigure(0, weight=1)
-        count = int(data.get("isolated_count", len(items)))
-        theme.Label(toolbar, text=f"{count:,} files safely isolated", font=theme.font("section", "bold"),
+        theme.Label(toolbar, text="Quarantined Files", font=theme.font("section", "bold"),
                     text_color=theme.TEXT, anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 4))
         theme.Label(toolbar, text="Files remain isolated until permanently deleted. Security history is retained.",
                     text_color=theme.TEXT_MUTED, anchor="w", justify="left").grid(row=1, column=0, sticky="ew", pady=4)
@@ -349,22 +359,22 @@ class QuarantinePage(BasePage):
             checkbox = ctk.CTkCheckBox(card, text="", width=32, height=44, variable=variable, command=lambda value=ref: self._toggle_item(value),
                                        fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, border_color=theme.TEXT_MUTED,
                                        checkmark_color=theme.BG)
-            checkbox.grid(row=0, column=0, padx=(16, 8), pady=(10, 0), sticky="nw")
+            checkbox.grid(row=0, column=0, rowspan=3, padx=(16, 8), pady=10, sticky="w")
             checkbox._canvas.configure(takefocus=1)
             checkbox.bind("<space>", lambda event, widget=checkbox: widget.toggle())
             checkbox.bind("<Return>", lambda event, widget=checkbox: widget.toggle())
             checkbox.bind("<FocusIn>", lambda event, widget=checkbox: widget.configure(border_color=theme.TEXT))
             checkbox.bind("<FocusOut>", lambda event, widget=checkbox: widget.configure(border_color=theme.TEXT_MUTED))
             self._selection_widgets[ref] = (variable, checkbox, card)
-            theme.Label(card, text=item.get("name", "Isolated file"), font=theme.font("card", "bold"), text_color=theme.TEXT,
-                        anchor="w").grid(row=0, column=1, padx=(0, 16), pady=(10, 0), sticky="ew")
+            theme.Label(card, text=compact_text(item.get("name", "Isolated file"), 72), font=theme.font("card", "bold"), text_color=theme.TEXT,
+                        anchor="w", auto_wrap=False).grid(row=0, column=1, padx=(0, 16), pady=(10, 2), sticky="ew")
+            theme.Label(card, text=f"Original location: {compact_text(item.get('original_location', 'Unavailable'), 92)}", font=theme.font("secondary"), text_color=theme.TEXT_DIM,
+                        anchor="w", auto_wrap=False).grid(row=1, column=1, padx=(0, 16), pady=2, sticky="ew")
             theme.Label(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=theme.font("secondary"), text_color=theme.TEXT_MUTED,
-                        anchor="w").grid(row=1, column=0, columnspan=2, padx=16, pady=4, sticky="ew")
-            theme.Label(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=theme.font("secondary"), text_color=theme.TEXT_DIM,
-                        anchor="w", justify="left").grid(row=2, column=0, columnspan=2, padx=16, pady=4, sticky="ew")
-            StatusBadge(card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")).grid(row=3, column=0, columnspan=2, padx=16, pady=4, sticky="w")
+                        anchor="w").grid(row=2, column=1, padx=(0, 16), pady=(2, 10), sticky="ew")
+            StatusBadge(card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")).grid(row=0, column=2, rowspan=3, padx=8, sticky="e")
             actions = ctk.CTkFrame(card, fg_color="transparent", height=1)
-            actions.grid(row=4, column=0, columnspan=2, padx=16, pady=(4, 12), sticky="w")
+            actions.grid(row=0, column=3, rowspan=3, padx=(8, 14), pady=8, sticky="e")
             view = self._button(actions, text="View", command=lambda value=ref: self.controller.open_quarantine_details(value), width=90)
             view.grid(row=0, column=0, padx=(0, 8))
             delete = theme.Button(actions, text="Delete", command=lambda value=ref: self._confirm_delete((value,)), fg_color=theme.DANGER_DARK,

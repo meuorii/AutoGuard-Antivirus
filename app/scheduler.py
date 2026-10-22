@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Protocol
 
 from app.hashing import normalize_path
 from app.models import DetectionStatus, ScanResult, ScanSource, ScanStatus, ScanSummary, ScanType
+from app.scan_progress import ScanProgress
 from app.scanner import ScanInterruptedError, Scanner
 
 try:  # Runtime dependency. Tests inject a deterministic APScheduler-compatible fake.
@@ -105,6 +106,11 @@ class AutomaticScanProgress:
     dangerous: int = 0
     errors: int = 0
     current_path: str = ""
+    phase: str = "discovering"
+    total: int | None = None
+    elapsed: float = 0.0
+    eta_seconds: float | None = None
+    bytes_processed: int = 0
 
     @property
     def files_checked(self) -> int:
@@ -172,13 +178,17 @@ class ScanScheduler:
         self._completed: list[ScanBatchResult] = []
         self._last_error: str | None = None
         self._active_progress: dict[ScanKind, AutomaticScanProgress] = {}
+        self._progress_trackers: dict[ScanKind, ScanProgress] = {}
+        self._progress_batch_bases: dict[ScanKind, int] = {}
         try:
             scan_parameters = inspect.signature(self.scanner.scan).parameters
             self._scanner_supports_progress = (
                 "on_result" in scan_parameters and "on_discovered" in scan_parameters
             )
+            self._scanner_supports_phase = "on_phase" in scan_parameters
         except (TypeError, ValueError):
             self._scanner_supports_progress = False
+            self._scanner_supports_phase = False
 
     @staticmethod
     def _normalize_targets(paths: Iterable[str | Path]) -> tuple[Path, ...]:
@@ -276,10 +286,26 @@ class ScanScheduler:
         )
         with self._lock:
             self._active_progress[kind] = snapshot
+            self._progress_trackers[kind] = ScanProgress.start()
+            self._progress_batch_bases[kind] = 0
 
     def _clear_progress(self, kind: ScanKind) -> None:
         with self._lock:
             self._active_progress.pop(kind, None)
+            self._progress_trackers.pop(kind, None)
+            self._progress_batch_bases.pop(kind, None)
+
+    def _progress_phase(self, kind: ScanKind, phase: str, total: int | None) -> None:
+        with self._lock:
+            current = self._active_progress.get(kind)
+            tracker = self._progress_trackers.get(kind)
+            if current is None or tracker is None:
+                return
+            if total is not None and phase in ("scanning", "finalizing"):
+                total += self._progress_batch_bases.get(kind, 0)
+            tracker.set_phase(phase, total)
+            metrics = tracker.snapshot()
+            self._active_progress[kind] = replace(current, **metrics)
 
     def _progress_discovered(self, kind: ScanKind, path: str, entry_kind: str) -> None:
         with self._lock:
@@ -290,13 +316,23 @@ class ScanScheduler:
                 current,
                 discovered=current.discovered + (1 if entry_kind == "file" else 0),
                 current_path=str(path),
+                total=(max(current.total, current.discovered + 1) if current.total is not None else None),
             )
+            tracker = self._progress_trackers.get(kind)
+            if tracker is not None and tracker.total is not None:
+                tracker.total = max(tracker.total, current.discovered + 1)
 
     def _progress_result(self, kind: ScanKind, result: ScanResult) -> None:
         with self._lock:
             current = self._active_progress.get(kind)
+            tracker = self._progress_trackers.get(kind)
             if current is None:
                 return
+            if tracker is not None:
+                tracker.record_result(size_bytes=(result.observation.size_bytes if result.observation else 0))
+                metrics = tracker.snapshot()
+            else:
+                metrics = {}
             scanned = current.scanned
             skipped = current.skipped
             errors = current.errors
@@ -315,13 +351,14 @@ class ScanScheduler:
                 dangerous += 1
             self._active_progress[kind] = replace(
                 current,
-                processed=current.processed + 1,
+                processed=metrics.get("processed", current.processed + 1),
                 scanned=scanned,
                 skipped=skipped,
                 suspicious=suspicious,
                 dangerous=dangerous,
                 errors=errors,
                 current_path=str(result.path),
+                **{key: value for key, value in metrics.items() if key != "processed"},
             )
 
     def active_scan_progress(self) -> AutomaticScanProgress | None:
@@ -457,7 +494,15 @@ class ScanScheduler:
                             active_kind, result
                         ),
                     )
+                    if self._scanner_supports_phase:
+                        scan_kwargs["on_phase"] = lambda phase, total, active_kind=kind: self._progress_phase(
+                            active_kind, phase, total
+                        )
                 summaries.append(self.scanner.scan(target, source, **scan_kwargs))
+                with self._lock:
+                    tracker = self._progress_trackers.get(kind)
+                    if tracker is not None:
+                        self._progress_batch_bases[kind] = tracker.processed
             except ScanInterruptedError as error:
                 interrupted = True
                 if not (user_stop.is_set() and not self._shutdown_event.is_set()):

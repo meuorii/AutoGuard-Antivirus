@@ -9,7 +9,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
-from app.ui.components import ConfirmDialog, SectionHeader, StateCard, StatusBadge
+from app.ui.components import ConfirmDialog, SectionHeader, StateCard, StatusBadge, SummaryStatCard, compact_text
 from app.ui.threat_details_page import ThreatDetailsView
 
 
@@ -27,7 +27,7 @@ _STATUS_STYLE = {
 
 class ThreatsPage(BasePage):
     title = "Threats"
-    subtitle = "Review threats AutoGuard has observed and handled"
+    subtitle = "Review, manage, and resolve detected security threats."
 
     def __init__(self, master, controller, **kwargs):
         super().__init__(master, controller, **kwargs)
@@ -203,13 +203,23 @@ class ThreatsPage(BasePage):
             if section in grouped:
                 grouped[section].append(row)
 
-        self._render_bulk_toolbar(rows)
+        summary = ctk.CTkFrame(self.body, fg_color="transparent")
+        summary.grid(row=0, column=0, padx=8, pady=(0, 8), sticky="ew")
+        summary.grid_columnconfigure((0, 1, 2), weight=1, uniform="threat-summary")
+        SummaryStatCard(summary, "Active Threats", len(grouped["Needs attention"]),
+                        "Require review or action", tone="warning").grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        SummaryStatCard(summary, "Contained Threats", len(grouped["Contained"]),
+                        "Isolated by AutoGuard", tone="success").grid(row=0, column=1, padx=6, sticky="ew")
+        SummaryStatCard(summary, "Resolved Threats", len(grouped["Resolved"]),
+                        "Historical incidents retained").grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        self._render_bulk_toolbar(rows, row=1)
 
         if not grouped["Needs attention"]:
-            self._empty_attention(1)
-            next_row = 2
+            self._empty_attention(2)
+            next_row = 3
         else:
-            next_row = self._render_section(1, "Needs attention", grouped["Needs attention"])
+            next_row = self._render_section(2, "Needs attention", grouped["Needs attention"])
 
         for section in ("Contained", "Resolved"):
             items = grouped[section]
@@ -270,7 +280,7 @@ class ThreatsPage(BasePage):
         top.grid_columnconfigure(0, weight=1)
         theme.Label(
             top,
-            text=item.get("name", "Threat"),
+            text=compact_text(item.get("name", "Threat"), 72),
             font=theme.font("card", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
@@ -283,12 +293,11 @@ class ThreatsPage(BasePage):
 
         theme.Label(
             card,
-            text=item.get("location", "Location unavailable"),
+            text=compact_text(item.get("location", "Location unavailable"), 92),
             font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
-            justify="left",
-            wraplength=760,
+            auto_wrap=False,
         ).grid(row=1, column=1, padx=16, sticky="ew")
 
         meta_parts = [f"Detected {item.get('detected', 'time unavailable')}"]
@@ -316,12 +325,12 @@ class ThreatsPage(BasePage):
             command=lambda ref=threat_ref: self.controller.open_threat_details(ref),
         ).grid(row=2, column=1, padx=16, pady=(6, 14), sticky="e")
 
-    def _render_bulk_toolbar(self, rows) -> None:
+    def _render_bulk_toolbar(self, rows, *, row=0) -> None:
         refs = {str(row.get("threat_ref")) for row in rows if row.get("threat_ref")}
         selected_count = len(self._selected_refs)
         toolbar = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1,
                                border_color=theme.BORDER, corner_radius=theme.RADIUS)
-        toolbar.grid(row=0, column=0, padx=8, pady=(0, 8), sticky="ew")
+        toolbar.grid(row=row, column=0, padx=8, pady=(0, 8), sticky="ew")
         theme.Label(toolbar, text=f"{selected_count} selected", text_color=theme.TEXT,
                     font=theme.font("body", "bold", theme.FONT)).grid(row=0, column=0, padx=12, pady=9, sticky="w")
         theme.Button(toolbar, text="Select All", width=90, height=28,

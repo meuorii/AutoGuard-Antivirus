@@ -348,7 +348,10 @@ def test_database_finalization_failure_preserves_claim_and_blocks_repeated_dispo
 
 def test_filter_entry_write_trace_is_removed_before_widget_destruction():
     import tkinter as tk
-    interpreter = tk.Tcl()
+    try:
+        interpreter = tk.Tcl()
+    except tk.TclError as error:
+        pytest.skip(f"Tcl runtime is unavailable in this Python installation: {error}")
     variable = tk.StringVar(master=interpreter, value="")
     invoked = []
     callback = variable.trace_add("write", lambda *args: invoked.append(True))

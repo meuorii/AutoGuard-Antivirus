@@ -1,6 +1,6 @@
 """Phase 02: durable session sequence, bounded reads and request coordination."""
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import threading
@@ -215,19 +215,19 @@ def test_page_ignores_stale_responses_and_hidden_results():
     assert page._loading
 
 
-def test_idle_dashboard_does_not_queue_reads_and_live_requests_are_coalesced():
-    refreshes = []
-    page = SimpleNamespace(_automatic_signature=None, scan_data_changed=lambda: refreshes.append("live"),
-                           refresh_from_state=lambda reason: refreshes.append("final"))
+def test_dashboard_progress_does_not_queue_activity_reads():
+    jobs = []
+    page = SimpleNamespace(_visible=True, _change_job=None, _selected_date=None,
+                           after=lambda delay, callback: jobs.append((delay, callback)) or "job",
+                           _schedule_change_refresh=lambda: ActivityPage._schedule_change_refresh(page),
+                           _flush_change_refresh=lambda: None)
     for _ in range(10):
         ActivityPage.handle_message(page, UIMessage("dashboard_data", {"result": {"active_scan": None}}))
-    assert refreshes == []
-    progress = {"result": {"active_scan": {"processed": 4}}}
-    ActivityPage.handle_message(page, UIMessage("dashboard_data", progress))
-    ActivityPage.handle_message(page, UIMessage("dashboard_data", progress))
-    assert refreshes == ["live"]
-    ActivityPage.handle_message(page, UIMessage("dashboard_data", {"result": {"active_scan": None}}))
-    assert refreshes == ["live", "final"]
+    assert jobs == []
+    event = UIMessage("scan_history_changed", {"local_date": date.today().isoformat()})
+    for _ in range(500):
+        ActivityPage.handle_message(page, event)
+    assert len(jobs) == 1 and jobs[0][0] == 1000
 
 
 def test_large_session_page_uses_index_and_only_materializes_50_results(history):
@@ -256,14 +256,17 @@ def test_large_session_page_uses_index_and_only_materializes_50_results(history)
 def page_double():
     calls, states = [], []
     page = SimpleNamespace(
-        _request_id=1, _visible=True, _loading=True, _pending_final=False, _pending_live=False,
+        _request_id=1, _visible=True, _loading=True, _pending_refresh=False, _force_render=False,
+        _scroll_restore_pending=True, _scroll_position=0,
         _data={"items": [], "total": 0, "page": 0, "page_size": 50}, _watchdog_id="watchdog", _live_job=None,
-        _page=0, _session_id=None, _filters={}, _last_live_read=time.monotonic(),
+        _page=0, _selected_date=None, _filters={"status": "all", "scan_type": None, "search": ""},
         _cancel_timer=lambda name: None, _update_pager=lambda: None,
         loading_label=SimpleNamespace(configure=lambda **kwargs: None),
         controller=SimpleNamespace(request_activity_view=lambda token, **kwargs: calls.append(token),
                                    cancel_activity_view=lambda: calls.append("cancel")),
-        after=lambda delay, callback: "timer", _state=lambda *args, **kwargs: states.append(args),
+        after=lambda delay, callback: "timer", after_idle=lambda callback: None,
+        _state=lambda *args, **kwargs: states.append(args),
+        _flush_change_refresh=lambda: None,
     )
     page.refresh = lambda: ActivityPage.refresh(page)
     return page, calls, states
@@ -271,18 +274,17 @@ def page_double():
 
 def test_final_event_during_read_is_not_lost():
     page, calls, _ = page_double()
-    ActivityPage.refresh_from_state(page, "scan_completed")
-    assert page._pending_final and not calls
+    page._pending_refresh = True
     ActivityPage.handle_message(page, UIMessage("activity_view_data", {"request_id": 1, "result": page._data}))
     assert calls == [2]
-    assert page._loading and not page._pending_final
+    assert page._loading and not page._pending_refresh
 
 
 def test_timeout_invalidates_late_response_and_can_retry():
     page, calls, states = page_double()
     ActivityPage._timeout(page, 1)
     assert not page._loading and page._data is None
-    assert calls == ["cancel"] and states[0][0] == "Unable to load scan results"
+    assert calls == ["cancel"] and states[0][0] == "Unable to load scan history"
     ActivityPage.handle_message(page, UIMessage("activity_view_data", {"request_id": 1, "result": {}}))
     assert page._data is None
     page.refresh()
@@ -291,15 +293,12 @@ def test_timeout_invalidates_late_response_and_can_retry():
 
 def test_high_frequency_results_schedule_one_read_without_polling():
     jobs = []
-    page = SimpleNamespace(_visible=True, _session_id=None, _live_job=None, _loading=True,
-                           _pending_live=False, _last_live_read=time.monotonic())
+    page = SimpleNamespace(_visible=True, _selected_date=None, _change_job=None)
     page.after = lambda delay, callback: jobs.append((delay, callback)) or "timer"
-    page._live_refresh = lambda: ActivityPage._live_refresh(page)
+    page._flush_change_refresh = lambda: None
     for _ in range(500):
-        ActivityPage.scan_data_changed(page)
-    assert len(jobs) == 1 and jobs[0][0] > 3000
-    jobs[0][1]()
-    assert page._pending_live and len(jobs) == 1 and page._live_job is None
+        ActivityPage._schedule_change_refresh(page)
+    assert len(jobs) == 1 and jobs[0][0] == 1000
 
 
 def test_unchanged_background_history_does_not_reload():
@@ -309,4 +308,4 @@ def test_unchanged_background_history_does_not_reload():
     revision = (("session-1", "COMPLETED", 4),)
     for _ in range(5):
         ActivityPage.handle_message(page, UIMessage("dashboard_data", {"result": {"scan_history_revision": revision}}))
-    assert changes == ["change"]
+    assert changes == []

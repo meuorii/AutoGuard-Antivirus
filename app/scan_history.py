@@ -1,7 +1,8 @@
 """Persistent scan lifecycle and immutable per-outcome evidence snapshots."""
 
 import sqlite3
-from datetime import datetime, timezone
+import threading
+from datetime import date, datetime, time as day_time, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -68,6 +69,28 @@ def _running(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row:
 class ScanHistory:
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._listener_lock = threading.RLock()
+        self._change_listeners = set()
+
+    def add_change_listener(self, listener):
+        """Subscribe to committed scan-history changes; return an unsubscribe function."""
+        with self._listener_lock:
+            self._change_listeners.add(listener)
+        def unsubscribe():
+            with self._listener_lock:
+                self._change_listeners.discard(listener)
+        return unsubscribe
+
+    def _notify_changed(self, session_id: str, recorded_at: datetime | str) -> None:
+        value = datetime.fromisoformat(recorded_at) if isinstance(recorded_at, str) else recorded_at
+        with self._listener_lock:
+            listeners = tuple(self._change_listeners)
+        for listener in listeners:
+            try:
+                listener(session_id, value)
+            except Exception:
+                # Presentation listeners are advisory; committed scan evidence wins.
+                continue
 
     def start_session(
         self, scan_type: ScanType, source_path: str | Path,
@@ -157,9 +180,12 @@ class ScanHistory:
                 raise
 
         if _connection is not None:
-            return persist(_connection)
-        with self.database.connection() as connection:
-            return persist(connection)
+            saved = persist(_connection)
+        else:
+            with self.database.connection() as connection:
+                saved = persist(connection)
+        self._notify_changed(session_id, saved.recorded_at)
+        return saved
 
     def finish_session(
         self, session_id: str, *, error: str | None = None, interrupted: bool = False,
@@ -247,6 +273,110 @@ class ScanHistory:
             raise ValueError("page must be a nonnegative integer")
         if type(page_size) is not int or not 1 <= page_size <= 100:
             raise ValueError("page_size must be between 1 and 100")
+
+    @staticmethod
+    def _local_day_bounds(local_day: str) -> tuple[str, str]:
+        selected = date.fromisoformat(str(local_day))
+        start = datetime.combine(selected, day_time.min).astimezone().astimezone(timezone.utc)
+        end = datetime.combine(date.fromordinal(selected.toordinal() + 1), day_time.min).astimezone().astimezone(timezone.utc)
+        return (start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds"))
+
+    def scan_date_page(self, *, page=0, page_size=30) -> dict:
+        """Page unique local dates and aggregate file outcomes without loading sessions."""
+        self._validate_page(page, page_size)
+        with self.database.connection() as connection:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("BEGIN")
+            total = int(connection.execute(
+                "SELECT COUNT(DISTINCT date(recorded_at, 'localtime')) FROM scan_results WHERE entry_kind = 'file'"
+            ).fetchone()[0])
+            rows = connection.execute(
+                """SELECT date(recorded_at, 'localtime') AS local_date,
+                          COUNT(*) AS total,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'NO_DETECTION' THEN 1 ELSE 0 END) AS safe,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'LOW_CONFIDENCE' THEN 1 ELSE 0 END) AS suspicious,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'HIGH_CONFIDENCE' THEN 1 ELSE 0 END) AS dangerous,
+                          SUM(CASE WHEN result_category LIKE 'SKIPPED_%' THEN 1 ELSE 0 END) AS skipped,
+                          SUM(CASE WHEN result_category = 'ERROR' THEN 1 ELSE 0 END) AS errors
+                   FROM scan_results WHERE entry_kind = 'file'
+                   GROUP BY local_date ORDER BY local_date DESC LIMIT ? OFFSET ?""",
+                (page_size, page * page_size),
+            ).fetchall()
+        return {"items": [{key: row[key] for key in row.keys()} for row in rows],
+                "total": total, "page": page, "page_size": page_size}
+
+    def daily_results_page(self, local_day: str, *, page=0, page_size=50,
+                           status=None, scan_type=None, search="") -> dict:
+        """Read one local day's files with stable daily ordinals and bounded output."""
+        self._validate_page(page, page_size)
+        start_at, end_at = self._local_day_bounds(local_day)
+        status = str(status or "all").lower()
+        status_clauses = {
+            "all": None,
+            "safe": "numbered.result_category = 'SCANNED' AND numbered.detection_status = 'NO_DETECTION'",
+            "suspicious": "numbered.result_category = 'SCANNED' AND numbered.detection_status = 'LOW_CONFIDENCE'",
+            "dangerous": "numbered.result_category = 'SCANNED' AND numbered.detection_status = 'HIGH_CONFIDENCE'",
+            "skipped_errors": "numbered.result_category <> 'SCANNED'",
+        }
+        if status not in status_clauses:
+            raise ValueError("Unknown Activity detection filter.")
+        clauses, parameters = [], []
+        if status_clauses[status]:
+            clauses.append(status_clauses[status])
+        if scan_type:
+            kind = ScanType(scan_type).value
+            if kind in {"scheduled", "startup", "usb"}:
+                clauses.append("(ss.scan_type = ? OR ss.source = ?)")
+                parameters.extend((kind, kind))
+            else:
+                clauses.append("ss.scan_type = ?")
+                parameters.append(kind)
+        query = str(search or "").strip()
+        if query:
+            clauses.append("lower(numbered.path) LIKE ? ESCAPE '\\'")
+            escaped = query.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            parameters.append(f"%{escaped}%")
+        filtered = " WHERE " + " AND ".join(clauses) if clauses else ""
+        base_parameters = (start_at, end_at)
+        with self.database.connection() as connection:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("BEGIN")
+            summary = connection.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'NO_DETECTION' THEN 1 ELSE 0 END) AS safe,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'LOW_CONFIDENCE' THEN 1 ELSE 0 END) AS suspicious,
+                          SUM(CASE WHEN result_category = 'SCANNED' AND detection_status = 'HIGH_CONFIDENCE' THEN 1 ELSE 0 END) AS dangerous,
+                          SUM(CASE WHEN result_category LIKE 'SKIPPED_%' THEN 1 ELSE 0 END) AS skipped,
+                          SUM(CASE WHEN result_category = 'ERROR' THEN 1 ELSE 0 END) AS errors
+                   FROM scan_results WHERE entry_kind = 'file' AND recorded_at >= ? AND recorded_at < ?""",
+                base_parameters,
+            ).fetchone()
+            count_filter = " AND ".join(
+                clause.replace("numbered.", "sr.") for clause in clauses
+            )
+            total = int(connection.execute(
+                """SELECT COUNT(*) FROM scan_results AS sr JOIN scan_sessions AS ss ON ss.id = sr.session_id
+                   WHERE sr.entry_kind = 'file' AND sr.recorded_at >= ? AND sr.recorded_at < ?"""
+                + (" AND " + count_filter if count_filter else ""),
+                (*base_parameters, *parameters),
+            ).fetchone()[0])
+            rows = connection.execute(
+                """WITH numbered AS (
+                       SELECT sr.*, ROW_NUMBER() OVER (ORDER BY sr.recorded_at, sr.id) AS daily_order
+                       FROM scan_results AS sr
+                       WHERE sr.entry_kind = 'file' AND sr.recorded_at >= ? AND sr.recorded_at < ?
+                   )
+                   SELECT numbered.*, ss.scan_type AS activity_scan_type, ss.source AS activity_source
+                   FROM numbered JOIN scan_sessions AS ss ON ss.id = numbered.session_id"""
+                + filtered + " ORDER BY numbered.recorded_at, numbered.id LIMIT ? OFFSET ?",
+                (*base_parameters, *parameters, page_size, page * page_size),
+            ).fetchall()
+        return {"local_date": str(local_day), "summary": {key: int(summary[key] or 0) for key in
+                ("total", "safe", "suspicious", "dangerous", "skipped", "errors")},
+                "total": total, "page": page, "page_size": page_size,
+                "items": [{"result": _result(row), "order": int(row["daily_order"]),
+                           "scan_type": ScanType(row["activity_scan_type"]),
+                           "source": ScanSource(row["activity_source"])} for row in rows]}
 
     @staticmethod
     def _safe_count(connection, session_id):

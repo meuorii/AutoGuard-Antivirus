@@ -13,6 +13,14 @@ import customtkinter as ctk
 from app.ui import theme
 
 
+def compact_text(value: Any, limit: int = 88) -> str:
+    """Keep list-row labels bounded while details views retain the full value."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
 class StatusBadge(theme.Label):
     """Small consistent status badge driven by an already user-facing key."""
 
@@ -106,6 +114,32 @@ class SectionHeader(ctk.CTkFrame):
         ).grid(row=0, column=0, sticky="w")
         if count is not None:
             StatusBadge(self, str(count), "idle").grid(row=0, column=1, sticky="e")
+
+
+class SummaryStatCard(ctk.CTkFrame):
+    """Compact statistic card with the same surface and type as Home."""
+
+    def __init__(self, master, title: str, value: int | str, detail: str = "", *, tone: str = "neutral", **kwargs):
+        color = {
+            "success": theme.SUCCESS,
+            "warning": theme.WARNING,
+            "danger": theme.DANGER,
+            "info": theme.INFO,
+            "neutral": theme.TEXT,
+        }.get(tone, theme.TEXT)
+        super().__init__(master, fg_color=theme.SURFACE, border_width=1,
+                         border_color=theme.BORDER, corner_radius=theme.RADIUS, **kwargs)
+        self.grid_columnconfigure(0, weight=1)
+        theme.Label(self, text=title, font=theme.font("body", "bold", theme.FONT),
+                    text_color=theme.TEXT_MUTED, anchor="w").grid(
+                        row=0, column=0, padx=14, pady=(12, 3), sticky="ew")
+        theme.Label(self, text=f"{value:,}" if isinstance(value, int) else str(value),
+                    font=theme.font("card", "bold", theme.FONT), text_color=color,
+                    anchor="w").grid(row=1, column=0, padx=14, sticky="ew")
+        if detail:
+            theme.Label(self, text=detail, font=theme.font("secondary", "normal", theme.FONT),
+                        text_color=theme.TEXT_DIM, anchor="w").grid(
+                            row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
 
 
 class ExpandableDetails(ctk.CTkFrame):

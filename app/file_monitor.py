@@ -12,6 +12,7 @@ import queue
 import stat
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -62,6 +63,7 @@ class MonitorHealth:
     workers_alive: int
     monitored_paths: tuple[str, ...]
     scheduled_paths: tuple[str, ...]
+    active_paths: tuple[str, ...]
     queue_depth: int
     events_received: int
     events_queued: int
@@ -193,7 +195,8 @@ class FileMonitor:
         self._queue: queue.Queue[_ScanRequest | object] = queue.Queue()
         self._lock = threading.Lock()
         self._scheduled: set[Path] = set()
-        self._last_completed: dict[Path, float] = {}
+        self._active_paths: set[Path] = set()
+        self._last_completed: OrderedDict[Path, float] = OrderedDict()
         self._observer: ObserverProtocol | None = None
         self._handler = _WatchdogHandler(self)
         self._workers: list[threading.Thread] = []
@@ -231,6 +234,7 @@ class FileMonitor:
         with self._lock:
             running = self._running
             last_error = self._last_error
+            active_paths = tuple(str(path) for path in sorted(self._active_paths, key=str))
             counters = (
                 self._events_received,
                 self._events_queued,
@@ -252,6 +256,7 @@ class FileMonitor:
             workers_alive=workers_alive,
             monitored_paths=tuple(str(path) for path in self._monitored_paths),
             scheduled_paths=tuple(str(path) for path in self._scheduled_roots),
+            active_paths=active_paths,
             queue_depth=self._queue.qsize(),
             events_received=counters[0],
             events_queued=counters[1],
@@ -479,6 +484,8 @@ class FileMonitor:
                     self._last_error = f"{path}: {stability.reason}"
                 return
             try:
+                with self._lock:
+                    self._active_paths.add(path)
                 result = self.scanner.scan_file(
                     path,
                     ScanSource.FILE_MONITOR,
@@ -511,8 +518,12 @@ class FileMonitor:
         finally:
             completed_at = self._clock()
             with self._lock:
+                self._active_paths.discard(path)
                 self._scheduled.discard(path)
                 self._last_completed[path] = completed_at
+                self._last_completed.move_to_end(path)
+                while len(self._last_completed) > 10_000:
+                    self._last_completed.popitem(last=False)
 
     def _record_error(self, message: str) -> None:
         with self._lock: self._last_error = message

@@ -59,9 +59,10 @@ def test_message_bus_validates_kind_and_limit():
 
 class FakeScanner:
     def __init__(self):self.thread_id=None
-    def count_scan_entries(self,*args,**kwargs):raise AssertionError("UI must not pre-count scan entries")
-    def scan(self,path,source,*,scan_type,interrupt_check=None,on_result=None,on_discovered=None):
+    def count_scan_entries(self,*args,**kwargs):return 1
+    def scan(self,path,source,*,scan_type,interrupt_check=None,on_result=None,on_discovered=None,on_phase=None):
         self.thread_id=threading.get_ident();result=ScanResult(str(path),ScanStatus.SCANNED,"No threat detected.")
+        if on_phase:on_phase("discovering",None);on_phase("scanning",1)
         if on_discovered:on_discovered(str(path),"file")
         if on_result:on_result(result)
         time.sleep(0.04);return ScanSummary((result,),"session-1")
@@ -87,13 +88,53 @@ def test_controller_dispatches_manual_scan_off_calling_thread():
     try:
         assert elapsed < 0.03
         assert scanner.thread_id is not None and scanner.thread_id != calling_thread
-        discovered = next(item for item in seen if item.kind == "scan_discovered")
-        assert discovered.payload["discovered"] == 1 and discovered.payload["processed"] == 0
+        discovering = next(item for item in seen if item.kind == "scan_discovered" and item.payload["phase"] == "discovering")
+        assert discovering.payload["total"] is None
         progress = next(item for item in seen if item.kind == "scan_result")
         assert progress.payload["processed"] == 1
         assert progress.payload["discovered"] == 1
         assert progress.payload["progress"] == 1.0
+        assert progress.payload["phase"] == "scanning"
+        assert progress.payload["total"] == 1
         assert message.payload["result"].session_id == "session-1"
+    finally:
+        controller.shutdown()
+
+
+def test_controller_dispatches_custom_target_batch_as_one_worker_job(tmp_path):
+    class BatchScanner(FakeScanner):
+        def __init__(self):
+            super().__init__()
+            self.targets = None
+
+        def scan_many(self, paths, source, *, scan_type, interrupt_check=None,
+                      on_result=None, on_discovered=None, on_phase=None):
+            self.thread_id = threading.get_ident()
+            self.targets = tuple(paths)
+            if on_phase:on_phase("discovering",None);on_phase("scanning",len(self.targets))
+            results = []
+            for path in paths:
+                result = ScanResult(str(path), ScanStatus.SCANNED, "No threat detected.", session_id="batch-session")
+                if on_discovered:
+                    on_discovered(str(path), "file")
+                if on_result:
+                    on_result(result)
+                results.append(result)
+            return ScanSummary(tuple(results), "batch-session")
+
+    scanner = BatchScanner()
+    bus = UIMessageBus()
+    controller = AutoGuardUIController(fake_services(scanner), bus)
+    caller = threading.get_ident()
+    try:
+        assert controller.start_custom_scan((tmp_path / "one.txt", tmp_path / "two.txt"))
+        completed, seen = wait_for(bus, "scan_completed")
+        started = next(message for message in seen if message.kind == "scan_started")
+        assert started.payload["target_count"] == 2
+        assert scanner.thread_id != caller
+        assert len(scanner.targets) == 2
+        assert completed.payload["result"].session_id == "batch-session"
+        assert len([message for message in seen if message.kind == "scan_started"]) == 1
     finally:
         controller.shutdown()
 
@@ -132,10 +173,108 @@ def test_scanner_single_pass_discovery_matches_emitted_results(tmp_path):
     assert len(discovered)==2==len(emitted)==len(summary.results)
     assert {path for path,_ in discovered}=={result.path for result in summary.results}
 
-def test_controller_never_runs_metadata_precount_before_scan():
+
+def test_scanner_progress_reports_discovery_inventory_and_finalization(tmp_path):
+    database = Database(tmp_path / "progress.db")
+    database.initialize()
+    scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
+    folder = tmp_path / "progress-files"
+    folder.mkdir()
+    (folder / "one.txt").write_text("one", encoding="utf-8")
+    (folder / "two.txt").write_text("two", encoding="utf-8")
+    phases = []
+
+    scanner.scan(folder, on_phase=lambda phase, total: phases.append((phase, total)))
+
+    assert phases == [("discovering", None), ("scanning", 2), ("finalizing", 2)]
+
+
+def test_scanner_custom_scan_uses_one_session_and_prunes_overlapping_targets(tmp_path):
+    database = Database(tmp_path / "custom.db")
+    database.initialize()
+    scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    first = folder / "one.txt"
+    first.write_text("first", encoding="utf-8")
+    nested = folder / "nested"
+    nested.mkdir()
+    second = nested / "two.txt"
+    second.write_text("second", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("third", encoding="utf-8")
+
+    summary = scanner.scan_many((first, folder, second, outside, folder))
+    details = scanner.history.get_scan(summary.session_id)
+
+    assert len(summary.results) == 3
+    assert details is not None
+    assert details.session.scan_type is ScanType.MANUAL
+    assert {result.path for result in details.results} == {
+        str(first.resolve()).lower(), str(second.resolve()).lower(), str(outside.resolve()).lower()
+    }
+    assert [result.processing_order for result in details.results] == [1, 2, 3]
+
+
+def test_scanner_custom_batch_rejects_blank_paths_instead_of_scanning_working_directory():
+    import pytest
+
+    from app.scanner import normalize_scan_targets
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        normalize_scan_targets(("",))
+
+
+def test_scanner_custom_batch_continues_after_missing_target(tmp_path):
+    database = Database(tmp_path / "custom-errors.db")
+    database.initialize()
+    scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
+    missing = tmp_path / "missing.txt"
+    valid = tmp_path / "valid.txt"
+    valid.write_text("available", encoding="utf-8")
+
+    summary = scanner.scan_many((missing, valid))
+
+    assert len(summary.results) == 2
+    assert any(result.path == str(valid.resolve()).lower() and result.status is ScanStatus.SCANNED
+               for result in summary.results)
+    assert any(result.path == str(missing.resolve()).lower() and result.status is ScanStatus.ERROR
+               for result in summary.results)
+    details = scanner.history.get_scan(summary.session_id)
+    assert details is not None and len(details.results) == 2
+
+
+def test_scanner_custom_batch_cancellation_keeps_completed_file_results(tmp_path):
+    from app.scanner import ScanInterruptedError
+
+    database = Database(tmp_path / "custom-stop.db")
+    database.initialize()
+    scanner = Scanner(Detector(SignatureStore()), ThreatTrail(database))
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for name in ("one.txt", "two.txt", "three.txt"):
+        (folder / name).write_text(name, encoding="utf-8")
+    stopped = threading.Event()
+
+    def stop_after_first(_result):
+        stopped.set()
+
+    try:
+        scanner.scan_many((folder,), interrupt_check=stopped.is_set, on_result=stop_after_first)
+    except ScanInterruptedError as error:
+        details = scanner.history.get_scan(error.session_id)
+    else:
+        raise AssertionError("custom batch ignored cancellation")
+
+    assert details is not None
+    assert details.session.status.value == "INCOMPLETE"
+    assert len(details.results) == 1
+    assert details.results[0].processing_order == 1
+
+def test_controller_forwards_real_scanner_progress_phase_and_inventory():
     bus=UIMessageBus();scanner=FakeScanner();controller=AutoGuardUIController(fake_services(scanner),bus);controller.start_scan("instant.txt");_,seen=wait_for(bus,"scan_completed")
     try:
-        kinds=[m.kind for m in seen];assert "scan_counting" not in kinds and "scan_total" not in kinds;assert kinds.index("scan_started")<kinds.index("scan_discovered")<kinds.index("scan_result")<kinds.index("scan_completed")
+        kinds=[m.kind for m in seen];phases=[m.payload.get("phase") for m in seen if m.kind=="scan_discovered"];assert "discovering" in phases and "scanning" in phases;assert kinds.index("scan_started")<kinds.index("scan_discovered")<kinds.index("scan_result")<kinds.index("scan_completed")
     finally:controller.shutdown()
 
 
@@ -402,13 +541,15 @@ def test_ux_refresh_phase3_idle_scan_page_uses_simple_user_facing_choices():
     assert 'text="Scan your PC"' in source
     assert 'title="Quick Scan"' in source
     assert 'title="Full Scan"' in source
-    assert 'title="Custom Scan"' in source
+    assert 'text="Custom Scan"' in source
     assert 'recommended=True' in source
     assert "Downloads  •  Desktop  •  Documents" in source
     assert '"Start Quick Scan", self.controller.start_quick_scan' in source
     assert '"Start Full Scan", self.controller.start_full_scan' in source
-    assert '"Choose File", self._choose_file' in source
-    assert '"Choose Folder", self._choose_folder' in source
+    assert 'text="Add Files", command=self._choose_file' in source
+    assert 'text="Add Folder", command=self._choose_folder' in source
+    assert "filedialog.askopenfilenames(" in source
+    assert 'text="Scan Selected Files and Folders"' in source
     assert "Manual Scan" not in source
 
 
@@ -427,7 +568,7 @@ def test_ux_refresh_phase3_custom_scan_delegates_to_controller_without_scanner_l
         and node.value.attr == "controller"
     ]
     names = {node.attr for node in controller_calls}
-    assert {"start_scan", "start_quick_scan", "start_full_scan"} <= names
+    assert {"start_custom_scan", "start_quick_scan", "start_full_scan"} <= names
 
     # UI must not own antivirus work.
     for forbidden in ("hashlib", "sha256(", "Detector(", "inspect_file(", "ThreatTrail("):
@@ -454,7 +595,7 @@ def test_ux_refresh_phase4_active_scan_is_focused_and_has_no_fake_pause():
     ).read_text(encoding="utf-8")
 
     for required in (
-        "Files checked",
+            "Files processed",
         "Threats found",
         "Currently checking",
         "More details",
@@ -497,7 +638,7 @@ def test_ux_refresh_phase4_stop_scan_uses_cooperative_interrupt_without_blocking
 
         def scan(
             self, path, source, *, scan_type, interrupt_check=None,
-            on_result=None, on_discovered=None,
+            on_result=None, on_discovered=None, on_phase=None,
         ):
             self.thread_id = threading.get_ident()
             self.received_interrupt_check = callable(interrupt_check)
@@ -1363,6 +1504,7 @@ def _phase9_quarantine_services():
         verified_at=None,
         original_removed=True,
         failure_reason="Quarantine object permanently deleted by user.",
+        deleted_at=base + timedelta(minutes=2),
     )
     recovery_attempt = SimpleNamespace(
         status=RecoveryStatus.DESTINATION_CONFLICT,
@@ -1401,6 +1543,8 @@ def test_ux_refresh_phase9_quarantine_list_uses_safe_user_facing_rows_only():
         controller.shutdown()
 
     assert result["isolated_count"] == 1
+    assert result["verified_count"] == 1
+    assert result["verification_issues"] == 0
     assert len(result["items"]) == 1
     row = result["items"][0]
     assert row["name"] == "test-threat.bin"
@@ -1437,7 +1581,7 @@ def test_ux_refresh_phase9_main_quarantine_view_hides_storage_internals_and_has_
     detail = (root / "app/ui/quarantine_details_page.py").read_text(encoding="utf-8")
 
     for required in (
-        "safely isolated", "Original location:", 'text="View"',
+        "Total Quarantined", "Files currently isolated", "Original location:", 'text="View"',
         "Delete Selected", "Select All", "Deselect All", 'text="Delete"', "No files are currently isolated",
         "Loading quarantine", "Operation failed",
     ):
@@ -1688,17 +1832,16 @@ def test_ux_refresh_phase10_high_confidence_scan_does_not_duplicate_canonical_in
     assert [event["title"] for event in feed].count("Confirmed threat detected") == 1
 
 
-def test_phase02_activity_page_exposes_session_filters_and_honest_order_labels():
+def test_phase02_activity_page_exposes_date_grouped_file_history():
     root = Path(__file__).resolve().parents[1]
     page = (root / "app/ui/activity_page.py").read_text(encoding="utf-8")
     controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
 
-    for label in ("All scan types", "All statuses", "All dates", "No scan history",
-                  "No matching scans", "No recorded file results", "Back to Activity",
-                  "Scan Order", "Record Order", "Unable to load scan results"):
+    for label in ("All scan types", "All Files", "No scan history",
+                  "No matching files", "Back to dates", "Time Scanned",
+                  "Unable to load scan history"):
         assert label in page
-    assert 'section = "Today"' in controller
-    assert 'section = "Yesterday"' in controller
+    assert "scan_date_page" in controller and "daily_results_page" in controller
     for raw in ("incident_id", "sha256", "FIRST_OBSERVED"):
         assert raw not in page
 
@@ -1966,7 +2109,8 @@ def test_ux_refresh_phase12_read_refreshes_are_deduplicated():
     for task in ("refresh-dashboard", "load-threats", "load-quarantine", "load-settings"):
         assert f'self._submit_once("{task}"' in controller_source
     # Activity keeps its pre-existing explicit in-flight guard.
-    assert 'if "load-activity" in self.active_tasks()' in controller_source
+    assert "def set_activity_view_active" in controller_source
+    assert "scan_history_changed" in controller_source
 
 
 def test_ux_refresh_phase12_shared_components_are_reused_across_refreshed_pages():
@@ -1994,8 +2138,8 @@ def test_ux_refresh_phase12_user_facing_terminology_is_consistent():
     threat_details = (root / "app/ui/threat_details_page.py").read_text(encoding="utf-8")
 
     assert 'title = "Home"' in dashboard
-    assert 'title="Quick Scan"' in scan and 'title="Full Scan"' in scan and 'title="Custom Scan"' in scan
-    assert 'text="Files checked"' in active_scan
+    assert 'title="Quick Scan"' in scan and 'title="Full Scan"' in scan and 'text="Custom Scan"' in scan
+    assert 'text="Files processed"' in active_scan
     assert '("manual", "Manual Scan")' not in scan
     assert '"Threat resolved" if item.get("label") == "Incident resolved"' in threat_details
     for legacy in ('("incidents",', '("threat_trail",', '("history",'):

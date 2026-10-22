@@ -4,11 +4,11 @@ from app.ui.components.scan_progress import ScanProgressPanel
 from app.ui.components.scan_option_card import ScanOptionCard
 from app.ui.components.scan_result import ScanResultPanel
 from app.ui.components.active_scan import ActiveScanPanel
-from app.ui.components.common import SectionHeader, StateCard, StatusBadge
+from app.ui.components.common import SectionHeader, StateCard, StatusBadge, SummaryStatCard, compact_text
 from app.ui.components.dialogs import ConfirmDialog
 from app.ui.components.notifications import NotificationCenter
 
 __all__ = [
     "StatusCard", "ThreatCard", "ScanProgressPanel", "ScanOptionCard", "ActiveScanPanel", "ScanResultPanel",
-    "SectionHeader", "StateCard", "StatusBadge", "ConfirmDialog", "NotificationCenter",
+    "SectionHeader", "StateCard", "StatusBadge", "SummaryStatCard", "compact_text", "ConfirmDialog", "NotificationCenter",
 ]

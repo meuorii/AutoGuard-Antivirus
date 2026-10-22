@@ -89,11 +89,16 @@ def test_full_hash_with_bounded_script_preview(detector: Detector, tmp_path: Pat
     signatures = SignatureStore([Signature("Synthetic.LongFile.Fixture", inspection.fingerprint.sha256, SignatureKind.KNOWN_MALICIOUS, "Harmless bytes registered for this test.")])
     assert Detector(signatures).detect_file(path).status is DetectionStatus.HIGH_CONFIDENCE
 
-@pytest.mark.parametrize("changes", [{"sha256": "invalid"}, {"kind": "unrecognized_kind"}, {"kind": "autoguard_test", "sha256": "0" * 64}])
+@pytest.mark.parametrize("changes", [{"sha256": "invalid"}, {"kind": "unrecognized_kind"}])
 def test_invalid_signatures_are_rejected(tmp_path: Path, changes: dict) -> None:
     entry = {"name": "Synthetic.Fixture", "sha256": "a" * 64, "kind": "known_malicious", "description": "Test metadata."}; entry.update(changes)
     path = tmp_path / "invalid-signatures.json"; write_signatures(path, [entry])
     with pytest.raises(SignatureLoadError): load_signatures(path)
+
+def test_multiple_harmless_test_signatures_are_supported(tmp_path: Path) -> None:
+    entry = {"name": "Synthetic.Fixture", "sha256": "0" * 64, "kind": "autoguard_test", "description": "Harmless test metadata."}
+    path = tmp_path / "test-signatures.json"; write_signatures(path, [entry])
+    assert load_signatures(path).lookup("0" * 64) is not None
 
 def test_duplicate_signature_hashes_are_rejected(tmp_path: Path) -> None:
     path = tmp_path / "duplicates.json"; entry = {"name": "Synthetic.Fixture", "sha256": "a" * 64, "kind": "known_malicious"}

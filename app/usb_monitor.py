@@ -68,7 +68,7 @@ class USBMonitorStatus(str, Enum):
 
 @dataclass(frozen=True)
 class USBMonitorHealth:
-    status: USBMonitorStatus; running: bool; poller_alive: bool; workers_alive: int; drives_present: tuple[str, ...]; queue_depth: int; drives_detected: int; devices_removed: int; scans_queued: int; scans_started: int; scans_completed: int; scans_interrupted: int; scan_failures: int; last_error: str | None
+    status: USBMonitorStatus; running: bool; poller_alive: bool; workers_alive: int; drives_present: tuple[str, ...]; active_roots: tuple[str, ...]; queue_depth: int; drives_detected: int; devices_removed: int; scans_queued: int; scans_started: int; scans_completed: int; scans_interrupted: int; scan_failures: int; last_error: str | None
 
 @dataclass(frozen=True)
 class _DriveScanRequest:
@@ -88,6 +88,7 @@ class USBMonitor:
         self._lock, self._stop_event = threading.RLock(), threading.Event()
         self._poller, self._workers, self._running = None, [], False
         self._present, self._insertion_counters = {}, {}
+        self._active_roots: set[str] = set()
         self._queued_or_active, self._completed_insertions = set(), set()
         self._events, self._outcomes = deque(maxlen=event_history_limit), deque(maxlen=event_history_limit)
         self._event_sequence = self._drives_detected = self._devices_removed = self._scans_queued = self._scans_started = self._scans_completed = self._scans_interrupted = self._scan_failures = 0
@@ -120,13 +121,14 @@ class USBMonitor:
         with self._lock:
             running, last_error = self._running, self._last_error
             roots = tuple(str(item[0].root) for item in self._present.values())
+            active_roots = tuple(sorted(self._active_roots))
             counters = (self._drives_detected, self._devices_removed, self._scans_queued, self._scans_started, self._scans_completed, self._scans_interrupted, self._scan_failures)
         poller_alive = bool(self._poller and self._poller.is_alive())
         workers_alive = sum(w.is_alive() for w in self._workers)
         if not running: status = USBMonitorStatus.STOPPED
         elif last_error is not None or not poller_alive or workers_alive < self.worker_count: status = USBMonitorStatus.DEGRADED
         else: status = USBMonitorStatus.RUNNING
-        return USBMonitorHealth(status=status, running=running, poller_alive=poller_alive, workers_alive=workers_alive, drives_present=roots, queue_depth=self._queue.qsize(), drives_detected=counters[0], devices_removed=counters[1], scans_queued=counters[2], scans_started=counters[3], scans_completed=counters[4], scans_interrupted=counters[5], scan_failures=counters[6], last_error=last_error)
+        return USBMonitorHealth(status=status, running=running, poller_alive=poller_alive, workers_alive=workers_alive, drives_present=roots, active_roots=active_roots, queue_depth=self._queue.qsize(), drives_detected=counters[0], devices_removed=counters[1], scans_queued=counters[2], scans_started=counters[3], scans_completed=counters[4], scans_interrupted=counters[5], scan_failures=counters[6], last_error=last_error)
 
     def present_drives(self) -> tuple[RemovableDrive, ...]:
         with self._lock: return tuple(item[0] for item in self._present.values())
@@ -200,7 +202,9 @@ class USBMonitor:
             if request.removal_event.is_set():
                 self._record_interrupted(drive, insertion, None, "USB scan did not start because the drive was removed first.")
                 return
-            with self._lock: self._scans_started += 1
+            with self._lock:
+                self._scans_started += 1
+                self._active_roots.add(str(drive.root))
             self._emit(USBEventType.SCAN_STARTED, drive, insertion, message="Automatic USB scan started using the existing AutoGuard scanner pipeline.")
             try:
                 summary = self.scanner.scan_directory(drive.root, ScanSource.USB, scan_type=ScanType.USB, interrupt_check=request.removal_event.is_set)
@@ -232,7 +236,10 @@ class USBMonitor:
             self._emit(USBEventType.SCAN_COMPLETED, drive, insertion, session_id=session_id, message=message)
             self._append_outcome(USBScanOutcome(drive.device_id, str(drive.root), insertion, session_id, effective_status, message))
         finally:
-            with self._lock: self._queued_or_active.discard(token); self._completed_insertions.add(token)
+            with self._lock:
+                self._active_roots.discard(str(drive.root))
+                self._queued_or_active.discard(token)
+                self._completed_insertions.add(token)
 
     def _record_interrupted(self, drive: RemovableDrive, insertion: int, session_id: str | None, message: str) -> None:
         self._ensure_session_incomplete(session_id, message)

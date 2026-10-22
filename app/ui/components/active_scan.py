@@ -6,6 +6,7 @@ hashes, detects, quarantines, or touches scan-history persistence directly.
 """
 from __future__ import annotations
 
+import time
 import customtkinter as ctk
 
 from app.ui import theme
@@ -25,7 +26,7 @@ _SCAN_NAMES = {
 }
 
 _SCAN_MESSAGES = {
-    "manual": "Checking the selected file or folder...",
+    "manual": "Checking the selected files and folders...",
     "quick": "Checking common places where new files appear...",
     "full": "Checking your computer for threats. This may take a while...",
     "startup": "Checking common locations for threats...",
@@ -55,11 +56,20 @@ class ActiveScanPanel(ctk.CTkFrame):
         self._processed = 0
         self._counts = {
             "scanned": 0,
+            "safe": 0,
             "skipped": 0,
             "suspicious": 0,
             "dangerous": 0,
             "errors": 0,
         }
+        self._started_at = None
+        self._clock_after = None
+        self._phase = "discovering"
+        self._total = None
+        self._eta_seconds = None
+        self._bytes_processed = 0
+        self._elapsed_snapshot = None
+        self._elapsed_snapshot_at = None
         self._on_stop = on_stop
 
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -155,7 +165,7 @@ class ActiveScanPanel(ctk.CTkFrame):
         self.threats_value.grid(row=0, column=1, sticky="w")
         theme.Label(
             metrics,
-            text="Files checked",
+            text="Files processed",
             text_color=theme.TEXT_MUTED,
             font=theme.font("body", "normal", theme.FONT),
             anchor="w",
@@ -167,6 +177,15 @@ class ActiveScanPanel(ctk.CTkFrame):
             font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         ).grid(row=1, column=1, sticky="w")
+
+        self.timing_label = theme.Label(
+            metrics,
+            text="Elapsed: 0s  •  Estimated remaining: Calculating estimate...",
+            text_color=theme.TEXT_MUTED,
+            font=theme.font("body", "normal", theme.FONT),
+            anchor="w",
+        )
+        self.timing_label.grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky="ew")
 
         current = ctk.CTkFrame(progress_card, fg_color=theme.SURFACE_ALT, corner_radius=theme.RADIUS_SMALL)
         current.grid(row=3, column=0, padx=18, pady=(0, 16), sticky="ew")
@@ -235,10 +254,13 @@ class ActiveScanPanel(ctk.CTkFrame):
         details = (
             ("discovered", "Discovered"),
             ("processed", "Processed"),
+            ("scanned", "Scanned successfully"),
+            ("safe", "Safe"),
             ("skipped", "Skipped"),
             ("errors", "Errors"),
             ("suspicious", "Suspicious"),
             ("dangerous", "Dangerous"),
+            ("bytes", "Bytes processed"),
         )
         for index, (key, label) in enumerate(details):
             row = (index // 3) * 2
@@ -262,13 +284,26 @@ class ActiveScanPanel(ctk.CTkFrame):
 
         self.bind("<Configure>", self._resize_for_width)
 
-    def start(self, scan_type: str, target: str = "", *, stoppable: bool = True) -> None:
+    def start(self, scan_type: str, target: str = "", *, stoppable: bool = True,
+              target_count: int | None = None) -> None:
+        self._stop_clock()
         self._scan_type = scan_type or "manual"
         self._discovered = 0
         self._processed = 0
         self._counts = {key: 0 for key in self._counts}
+        self._bytes_processed = 0
         self.scan_type_label.configure(text=_SCAN_NAMES.get(self._scan_type, self._friendly_type()))
-        self.message_label.configure(text=_SCAN_MESSAGES.get(self._scan_type, "Checking your files for threats..."))
+        message = _SCAN_MESSAGES.get(self._scan_type, "Checking your files for threats...")
+        if target_count is not None:
+            message = f"Scanning {target_count:,} selected files and folders in one custom scan."
+        self.message_label.configure(text=message)
+        self._started_at = time.monotonic()
+        self._phase = "discovering"
+        self._total = None
+        self._eta_seconds = None
+        self._elapsed_snapshot = None
+        self._elapsed_snapshot_at = None
+        self._clock_tick()
         self.state_badge.configure(text="SCANNING")
         self.percent_label.configure(text="Scanning...")
         self.progress.stop()
@@ -284,9 +319,16 @@ class ActiveScanPanel(ctk.CTkFrame):
             self.stop_button.grid_remove()
         self._refresh_details()
 
-    def update_discovery(self, discovered: int, processed: int, current_path: str = "") -> None:
+    def update_discovery(self, discovered: int, processed: int, current_path: str = "", *,
+                         phase: str = "discovering", total: int | None = None,
+                         eta_seconds: float | None = None,
+                         bytes_processed: int = 0,
+                         elapsed_seconds: float | None = None) -> None:
         self._discovered = max(self._discovered, int(discovered), int(processed))
         self._processed = max(self._processed, int(processed))
+        self._bytes_processed = max(0, int(bytes_processed))
+        self._set_elapsed_snapshot(elapsed_seconds)
+        self._set_progress_state(phase, total, eta_seconds)
         if current_path:
             self.current_path_label.configure(text=current_path)
         self._paint_progress()
@@ -299,11 +341,21 @@ class ActiveScanPanel(ctk.CTkFrame):
         discovered: int,
         counts: dict[str, int],
         current_path: str = "",
+        phase: str = "scanning",
+        total: int | None = None,
+        eta_seconds: float | None = None,
+        bytes_processed: int = 0,
+        elapsed_seconds: float | None = None,
     ) -> None:
         self._processed = max(0, int(processed))
         self._discovered = max(self._processed, int(discovered))
         self._counts.update({key: int(value) for key, value in counts.items() if key in self._counts})
-        self.files_checked_value.configure(text=f"{self._counts['scanned']:,}")
+        self._bytes_processed = max(0, int(bytes_processed))
+        self._set_elapsed_snapshot(elapsed_seconds)
+        self._set_progress_state(phase, total, eta_seconds)
+        denominator = self._total if self._total is not None else self._discovered
+        total_text = f"{denominator:,}" if denominator else "?"
+        self.files_checked_value.configure(text=f"{self._processed:,} / {total_text}")
         # LOW_CONFIDENCE is suspicious evidence, not a confirmed threat.
         self.threats_value.configure(text=f"{self._counts['dangerous']:,}")
         if current_path:
@@ -313,6 +365,7 @@ class ActiveScanPanel(ctk.CTkFrame):
 
     def end(self) -> None:
         self.progress.stop()
+        self._stop_clock()
 
     def stopping(self) -> None:
         self.state_badge.configure(text="STOPPING")
@@ -326,24 +379,123 @@ class ActiveScanPanel(ctk.CTkFrame):
         self.percent_label.configure(text="Finishing...")
         self.stop_button.configure(state="disabled")
 
+    def complete(self) -> None:
+        self._stop_clock()
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self.progress.set(1)
+        self.percent_label.configure(text="100%")
+        self.state_badge.configure(text="COMPLETED")
+        self.message_label.configure(text="Scan completed successfully.")
+        self._eta_seconds = None
+        self._paint_timing()
+
+    def fail(self, message: str) -> None:
+        self.end()
+        self.state_badge.configure(text="FAILED")
+        self.message_label.configure(text=message or "Scan failed. See the diagnostic details.")
+        self.percent_label.configure(text="Incomplete")
+        self.stop_button.grid_remove()
+
+    def cancelled(self) -> None:
+        self.end()
+        self.state_badge.configure(text="INCOMPLETE")
+        self.message_label.configure(text="Scan stopped. Completed results were saved.")
+        self.percent_label.configure(text="Incomplete")
+        self.stop_button.grid_remove()
+
+    def _set_progress_state(self, phase: str, total: int | None, eta_seconds: float | None) -> None:
+        self._phase = phase
+        if total is not None:
+            self._total = max(self._processed, int(total))
+        self._eta_seconds = eta_seconds
+        if phase == "scanning" and self._total:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            fraction = min(0.99, self._processed / self._total)
+            self.progress.set(fraction)
+            self.percent_label.configure(text=f"{fraction * 100:.0f}%")
+            self.message_label.configure(text=f"Scanning files • {self._total:,} processing entries")
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+            self.percent_label.configure(text="Discovering files..." if phase == "discovering" else "Finalizing...")
+            self.message_label.configure(text="Discovering files..." if phase == "discovering" else "Finalizing scan...")
+        self._paint_timing()
+
+    def _clock_tick(self) -> None:
+        self._clock_after = None
+        if self._started_at is None:
+            return
+        self._paint_timing()
+        self._clock_after = self.after(1000, self._clock_tick)
+
+    def _stop_clock(self) -> None:
+        if self._clock_after is not None:
+            try:
+                self.after_cancel(self._clock_after)
+            except Exception:
+                pass
+            self._clock_after = None
+
+    def _paint_timing(self) -> None:
+        if self._elapsed_snapshot is not None and self._elapsed_snapshot_at is not None:
+            elapsed = max(0, int(self._elapsed_snapshot + time.monotonic() - self._elapsed_snapshot_at))
+        else:
+            elapsed = max(0, int(time.monotonic() - self._started_at)) if self._started_at is not None else 0
+        eta = "Estimated time unavailable"
+        if self._eta_seconds is not None:
+            eta = f"~{self._format_duration(self._eta_seconds)} remaining"
+        elif self._phase == "scanning":
+            eta = "Calculating estimate..." if self._total is not None else "Estimated time unavailable"
+        self.timing_label.configure(text=f"Elapsed: {self._format_duration(elapsed)}  •  {eta}")
+
+    def _set_elapsed_snapshot(self, elapsed_seconds: float | None) -> None:
+        if elapsed_seconds is not None:
+            self._elapsed_snapshot = max(0.0, float(elapsed_seconds))
+            self._elapsed_snapshot_at = time.monotonic()
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        value = max(0, int(seconds))
+        hours, remainder = divmod(value, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    @staticmethod
+    def _format_bytes(byte_count: int) -> str:
+        amount = float(max(0, byte_count))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+            amount /= 1024
+
     def _paint_progress(self) -> None:
-        # Single-pass discovery intentionally does not pre-count the whole tree,
-        # so discovered/processed is not a trustworthy total percentage. Keep
-        # the primary progress indicator indeterminate and expose those counters
-        # only under More details.
-        self.percent_label.configure(text="Scanning...")
+        denominator = self._total if self._total is not None else self._discovered
+        total_text = f"{denominator:,}" if denominator else "?"
+        self.files_checked_value.configure(text=f"{self._processed:,} / {total_text}")
+        self._set_progress_state(self._phase, self._total, self._eta_seconds)
 
     def _refresh_details(self) -> None:
         values = {
             "discovered": self._discovered,
             "processed": self._processed,
+            "scanned": self._counts["scanned"],
+            "safe": self._counts.get("safe", 0),
             "skipped": self._counts["skipped"],
             "errors": self._counts["errors"],
             "suspicious": self._counts["suspicious"],
             "dangerous": self._counts["dangerous"],
+            "bytes": self._bytes_processed,
         }
         for key, value in values.items():
-            self.detail_values[key].configure(text=f"{value:,}")
+            rendered = self._format_bytes(value) if key == "bytes" else f"{value:,}"
+            self.detail_values[key].configure(text=rendered)
 
     def _resize_for_width(self, event) -> None:
         width = max(280, int(getattr(event, "width", 760)) - 80)

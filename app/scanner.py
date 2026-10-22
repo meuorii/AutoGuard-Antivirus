@@ -7,7 +7,7 @@ import stat
 import threading
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Iterator, Literal
+from typing import Callable, Iterable, Iterator, Literal
 
 from app.config import DEFAULT_MAX_FILE_SIZE_BYTES
 from app.cleanup_verifier import CleanupVerificationResult, CleanupVerifier
@@ -35,6 +35,37 @@ from app.threat_trail import ThreatTrail
 # Keep Phase 3 imports such as `from app.scanner import ScanStatus` working.
 ScanMode = Literal["auto", "file", "directory"]
 DiscoveryCallback = Callable[[str, EntryKind], None]
+PhaseCallback = Callable[[str, int | None], None]
+
+
+def normalize_scan_targets(paths: Iterable[str | Path]) -> tuple[Path, ...]:
+    """Normalize duplicate targets and omit paths already covered by a folder."""
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path is None or not str(path).strip():
+            raise ValueError("Scan target paths must not be empty.")
+        normalized = normalize_path(path)
+        key = os.path.normcase(str(normalized)).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    folders = tuple(
+        path for path in unique
+        if _is_scannable_directory(path)
+    )
+    return tuple(
+        path for path in unique
+        if not any(path != folder and folder in path.parents for folder in folders)
+    )
+
+
+def _is_scannable_directory(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not is_link_or_reparse(info)
 
 
 class ScanInterruptedError(RuntimeError):
@@ -103,6 +134,7 @@ class Scanner:
         interrupt_check: Callable[[], bool] | None = None,
         on_result: Callable[[ScanResult], None] | None = None,
         on_discovered: DiscoveryCallback | None = None,
+        on_phase: PhaseCallback | None = None,
     ) -> ScanSummary:
         """Dispatch a file or directory, with exactly one persistent session.
 
@@ -110,7 +142,7 @@ class Scanner:
         result has been persisted. Presentation layers must still dispatch the
         scan itself off their UI thread.
         """
-        return self._run(path, source, scan_type, "auto", interrupt_check, on_result=on_result, on_discovered=on_discovered)
+        return self._run(path, source, scan_type, "auto", interrupt_check, on_result=on_result, on_discovered=on_discovered, on_phase=on_phase)
 
     def scan_directory(
         self, path: str | Path, source: ScanSource | None = None,
@@ -118,8 +150,28 @@ class Scanner:
         interrupt_check: Callable[[], bool] | None = None,
         on_result: Callable[[ScanResult], None] | None = None,
         on_discovered: DiscoveryCallback | None = None,
+        on_phase: PhaseCallback | None = None,
     ) -> ScanSummary:
-        return self._run(path, source, scan_type, "directory", interrupt_check, on_result=on_result, on_discovered=on_discovered)
+        return self._run(path, source, scan_type, "directory", interrupt_check, on_result=on_result, on_discovered=on_discovered, on_phase=on_phase)
+
+    def scan_many(
+        self, paths: Iterable[str | Path], source: ScanSource | None = None,
+        *, scan_type: ScanType | None = None,
+        interrupt_check: Callable[[], bool] | None = None,
+        on_result: Callable[[ScanResult], None] | None = None,
+        on_discovered: DiscoveryCallback | None = None,
+        on_phase: PhaseCallback | None = None,
+    ) -> ScanSummary:
+        """Scan mixed files/folders as one persistent session and one batch result."""
+        roots = normalize_scan_targets(paths)
+        if not roots:
+            raise ValueError("Select at least one file or folder to scan.")
+        return self._run(
+            roots[0], source, scan_type, "auto", interrupt_check,
+            on_result=on_result, on_discovered=on_discovered,
+            on_phase=on_phase,
+            _additional_roots=roots[1:],
+        )
 
     def _run(
         self, path: str | Path, source: ScanSource | None,
@@ -127,6 +179,8 @@ class Scanner:
         interrupt_check: Callable[[], bool] | None = None,
         *, on_result: Callable[[ScanResult], None] | None = None,
         on_discovered: DiscoveryCallback | None = None,
+        on_phase: PhaseCallback | None = None,
+        _additional_roots: tuple[Path, ...] = (),
     ) -> ScanSummary:
         if scan_type is None:
             source = ScanSource.MANUAL if source is None else ScanSource(source)
@@ -135,7 +189,8 @@ class Scanner:
             scan_type = ScanType(scan_type)
             source = scan_type.default_source if source is None else ScanSource(source)
         root = normalize_path(path)
-        log = scanner_logger(); log.info("Scan starting type=%s source=%s root=%s", scan_type.value, source.value, root)
+        roots = (root, *tuple(normalize_path(item) for item in _additional_roots))
+        log = scanner_logger(); log.info("Scan starting type=%s source=%s roots=%s", scan_type.value, source.value, len(roots))
         self._current_reappearance_results = []
         try:
             session = self.history.start_session(scan_type, root, source)
@@ -147,6 +202,19 @@ class Scanner:
         results: list[ScanResult] = []
         stage = "processing"
         try:
+            if on_phase is not None:
+                try:
+                    on_phase("discovering", None)
+                except Exception:
+                    pass
+                total = sum(
+                    self.count_scan_entries(target, mode=mode, interrupt_check=interrupt_check)
+                    for target in roots
+                )
+                try:
+                    on_phase("scanning", total)
+                except Exception:
+                    pass
             # Reuse the two SQLite connections for the scan lifetime. Each
             # observation/result is still committed independently, preserving the
             # durable per-file history while avoiding thousands of connect/close
@@ -155,27 +223,49 @@ class Scanner:
                  self.history.database.connection() as history_connection:
                 self._persistence_local.trail_connection = trail_connection
                 try:
-                    for result in self._iter_scan(
-                        root, source, mode, interrupt_check, on_discovered
-                    ):
-                        result = replace(result, session_id=session.id)
-                        stage = f"saving result for {result.path}"
-                        self.history.record_result(
-                            session.id, result, _connection=history_connection
-                        )
-                        results.append(result)
-                        if on_result is not None:
-                            try:
-                                on_result(result)
-                            except Exception:
-                                # UI/progress observers are advisory and must never turn
-                                # a successful security scan into a scan failure.
-                                pass
-                        stage = "processing"
+                    for target in roots:
+                        self._raise_if_interrupted(interrupt_check, target)
+                        try:
+                            outcomes = self._iter_scan(
+                                target, source, mode, interrupt_check, on_discovered
+                            )
+                            for result in outcomes:
+                                result = replace(result, session_id=session.id)
+                                stage = f"saving result for {result.path}"
+                                self.history.record_result(
+                                    session.id, result, _connection=history_connection
+                                )
+                                results.append(result)
+                                if on_result is not None:
+                                    try:
+                                        on_result(result)
+                                    except Exception:
+                                        # UI/progress observers are advisory and must never turn
+                                        # a successful security scan into a scan failure.
+                                        pass
+                                stage = "processing"
+                        except OSError as target_error:
+                            # A target that disappears or becomes inaccessible must not
+                            # prevent the remaining selected targets from being checked.
+                            self._notify_discovered(on_discovered, target, "unknown")
+                            result = replace(self._failure(target, target_error, "unknown"), session_id=session.id)
+                            self.history.record_result(session.id, result, _connection=history_connection)
+                            results.append(result)
+                            if on_result is not None:
+                                try:
+                                    on_result(result)
+                                except Exception:
+                                    pass
+                            stage = "processing"
                 finally:
                     self._persistence_local.trail_connection = None
             stage = "finalizing history"
             self.history.finish_session(session.id)
+            if on_phase is not None:
+                try:
+                    on_phase("finalizing", len(results))
+                except Exception:
+                    pass
         except BaseException as error:
             # Persist progress on ordinary failures and Ctrl+C, then propagate.
             detail = f"{stage}: {type(error).__name__}: {error}"
@@ -287,12 +377,14 @@ class Scanner:
         self, root: Path,
         interrupt_check: Callable[[], bool] | None = None,
     ) -> int:
-        pending: list[tuple[Path, EntryKind]] = [(root, "directory")]
+        # Keep only directory paths queued. File entries are counted immediately,
+        # so this metadata pass does not retain the whole tree in memory.
+        pending: list[Path] = [root]
         visited: set[tuple[int, int]] = set()
         count = 0
         while pending:
             self._raise_if_interrupted(interrupt_check, root)
-            current, kind = pending.pop()
+            current = pending.pop()
             try:
                 info = current.lstat()
             except OSError:
@@ -313,15 +405,16 @@ class Scanner:
             try:
                 with os.scandir(current) as entries:
                     for entry in entries:
+                        self._raise_if_interrupted(interrupt_check, root)
                         try:
-                            entry_kind = (
-                                "directory"
-                                if entry.is_dir(follow_symlinks=False)
-                                else "file"
-                            )
+                            info = entry.stat(follow_symlinks=False)
                         except OSError:
-                            entry_kind = "unknown"
-                        pending.append((normalize_path(entry.path), entry_kind))
+                            count += 1
+                            continue
+                        if stat.S_ISDIR(info.st_mode) and not is_link_or_reparse(info):
+                            pending.append(normalize_path(entry.path))
+                        else:
+                            count += 1
             except OSError:
                 # The real scanner emits one directory issue for this path.
                 count += 1
@@ -341,7 +434,7 @@ class Scanner:
         if mode=="directory" and not directory:
             kind="directory" if stat.S_ISDIR(info.st_mode) else "file";self._notify_discovered(on_discovered,root,kind);yield ScanResult(str(root),ScanStatus.SKIPPED_UNSUPPORTED,"Expected a regular directory, not a file or link/reparse point.",kind)
         elif mode!="file" and directory:yield from self._iter_directory(root,source,interrupt_check,on_discovered)
-        else:self._notify_discovered(on_discovered,root,"directory" if stat.S_ISDIR(info.st_mode) else "file");yield self._process_file(root,info,source)
+        else:self._notify_discovered(on_discovered,root,"directory" if stat.S_ISDIR(info.st_mode) else "file");yield self._process_file(root,info,source,interrupt_check)
 
     def _iter_directory(self,root:Path,source:ScanSource,interrupt_check:Callable[[],bool]|None=None,on_discovered:DiscoveryCallback|None=None)->Iterator[ScanResult]:
         """Single-pass walk: announce result-producing entries as found, then scan them."""
@@ -353,13 +446,14 @@ class Scanner:
             self._raise_if_interrupted(interrupt_check,root);current,kind=pending.pop()
             try:info=current.lstat()
             except OSError as error:announce(current,kind);yield self._failure(current,error,kind);continue
-            if not stat.S_ISDIR(info.st_mode) or is_link_or_reparse(info):announce(current,kind);yield self._process_file(current,info,source);continue
+            if not stat.S_ISDIR(info.st_mode) or is_link_or_reparse(info):announce(current,kind);yield self._process_file(current,info,source,interrupt_check);continue
             identity=(info.st_dev,info.st_ino)
             if info.st_ino and identity in visited:announce(current,"directory");yield ScanResult(str(current),ScanStatus.SKIPPED_UNSUPPORTED,"Directory identity already visited; possible alias or loop.","directory");continue
             if info.st_ino:visited.add(identity)
             try:
                 with os.scandir(current) as entries:
                     for entry in entries:
+                        self._raise_if_interrupted(interrupt_check, root)
                         try:entry_kind="directory" if entry.is_dir(follow_symlinks=False) else "file"
                         except OSError:entry_kind="unknown"
                         path=normalize_path(entry.path);pending.append((path,entry_kind))
@@ -377,7 +471,8 @@ class Scanner:
             )
 
     def _process_file(
-        self, path: Path, info: os.stat_result, source: ScanSource
+        self, path: Path, info: os.stat_result, source: ScanSource,
+        interrupt_check: Callable[[], bool] | None = None,
     ) -> ScanResult:
         kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
         if is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
@@ -412,6 +507,7 @@ class Scanner:
             inspection = inspect_file(
                 path, preview_bytes=preview_bytes,
                 max_size_bytes=self.max_file_size_bytes, follow_symlinks=False,
+                interrupt_check=interrupt_check,
             )
             sha256 = inspection.fingerprint.sha256
             stage = "detection"
@@ -441,6 +537,8 @@ class Scanner:
                         detection, incident.id, source,
                         original_size=inspection.fingerprint.size_bytes,
                     )
+        except OperationInterrupted as error:
+            raise ScanInterruptedError(str(error)) from error
         except Exception as error:
             if stage == "read":
                 return self._failure(path, error, "file")

@@ -54,9 +54,9 @@ if tuple(PAGE_CLASSES) != tuple(key for key, _ in NAV_ITEMS):
 STATE_CHANGE_TARGETS = {
     "scan_started": {"home", "scan", "activity"},
     "scan_stopped": {"home", "scan", "activity"},
-    "scan_completed": {"home", "scan", "threats", "quarantine", "activity"},
-    "scan_batch_completed": {"home", "scan", "threats", "quarantine", "activity"},
-    # Per-file results can arrive rapidly; Activity reloads once at scan completion.
+    "scan_completed": {"home", "scan", "threats", "quarantine"},
+    "scan_batch_completed": {"home", "scan", "threats", "quarantine"},
+    # Per-file result-ready messages do not reload Activity; committed history changes are batched separately.
     "scan_result_ready": {"home", "scan", "threats", "quarantine"},
     "incident_verified": {"home", "threats", "activity"},
     "threat_resolved": {"home", "threats", "activity"},

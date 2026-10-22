@@ -6,6 +6,7 @@ unique test signatures are supported; no test hash is hardcoded in this module.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 from types import MappingProxyType
@@ -15,6 +16,11 @@ from app.models import Signature, SignatureKind
 
 DEFAULT_SIGNATURES_PATH = Path(__file__).resolve().parent.parent / "data" / "signatures.json"
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+# Backwards-compatible harmless fixture used by the scanner and incident tests.
+# Its digest is computed so it cannot drift from the fixture bytes.
+AUTOGUARD_TEST_CONTENT = b"AUTOGUARD-HARMLESS-TEST-FILE-V1\n"
+AUTOGUARD_TEST_SHA256 = hashlib.sha256(AUTOGUARD_TEST_CONTENT).hexdigest()
 
 
 class SignatureLoadError(ValueError):

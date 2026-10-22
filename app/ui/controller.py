@@ -23,6 +23,7 @@ from app.quarantine import QuarantineIntegrityStatus, QuarantineState
 from app.protection_state import state_from_health, state_from_service
 from app.recovery import RecoveryStatus
 from app.scanner import ScanInterruptedError
+from app.scan_progress import ScanProgress
 from app.startup import AutoGuardServices
 from app.windows_startup import WindowsStartupManager
 from app.ui.messages import UIMessageBus
@@ -49,6 +50,13 @@ class AutoGuardUIController:
         self._selected_quarantine_ref: str | None = None
         self._activity_pending = None
         self._activity_reader_running = False
+        self._activity_view_active = False
+        self._activity_change_pending = None
+        self._activity_change_timer = None
+        self._activity_last_change_notice = 0.0
+        history = getattr(getattr(services, "scanner", None), "history", None)
+        subscribe = getattr(history, "add_change_listener", None)
+        self._remove_activity_listener = subscribe(self._on_scan_history_changed) if callable(subscribe) else None
         self._quarantine_delete_busy = False
         self._threat_bulk_busy = False
 
@@ -57,6 +65,14 @@ class AutoGuardUIController:
         # executor is released. Scanner persistence remains authoritative.
         self.cancel_activity_view()
         self.stop_scan()
+        with self._lock:
+            self._activity_view_active = False
+            if self._activity_change_timer is not None:
+                self._activity_change_timer.cancel()
+                self._activity_change_timer = None
+        if self._remove_activity_listener is not None:
+            self._remove_activity_listener()
+            self._remove_activity_listener = None
         self._executor.shutdown(wait=False, cancel_futures=False)
 
     def active_tasks(self) -> tuple[str, ...]:
@@ -171,8 +187,38 @@ class AutoGuardUIController:
             "suspicious": int(getattr(progress, "suspicious", 0)),
             "dangerous": int(getattr(progress, "dangerous", 0)),
             "errors": int(getattr(progress, "errors", 0)),
+            "phase": str(getattr(progress, "phase", "discovering")),
+            "total": getattr(progress, "total", None),
+            "elapsed": float(getattr(progress, "elapsed", 0.0)),
+            "eta_seconds": getattr(progress, "eta_seconds", None),
+            "bytes_processed": int(getattr(progress, "bytes_processed", 0)),
             "current_path": str(getattr(progress, "current_path", "")),
             "started_at": getattr(progress, "started_at", None),
+        }
+
+    def realtime_scan_activity(self) -> dict[str, Any]:
+        """Expose protection readiness and active real-time or USB scan paths."""
+        monitor = getattr(self.services, "file_monitor", None)
+        usb_monitor = getattr(self.services, "usb_monitor", None)
+        running, degraded, active_paths, active_usb_roots = False, False, (), ()
+        try:
+            health = monitor.health() if monitor is not None else None
+            running = bool(getattr(health, "running", False))
+            status = getattr(getattr(health, "status", None), "value", "")
+            degraded = str(status).upper() == "DEGRADED"
+            active_paths = tuple(getattr(health, "active_paths", ()))
+        except Exception:
+            pass
+        try:
+            usb_health = usb_monitor.health() if usb_monitor is not None else None
+            active_usb_roots = tuple(getattr(usb_health, "active_roots", ()))
+        except Exception:
+            pass
+        return {
+            "running": running,
+            "degraded": degraded,
+            "active_paths": active_paths,
+            "active_usb_roots": active_usb_roots,
         }
 
     def _dashboard_snapshot(self) -> dict[str, Any]:
@@ -667,8 +713,8 @@ class AutoGuardUIController:
 
         self._selected_threat_ref = ref
         print(f"[AutoGuard DEBUG] Opening threat details: {ref}", flush=True)
-        self.navigate_to("threats")
         self.bus.publish("threat_details_requested", threat_ref=ref)
+        self.navigate_to("threats")
 
     def close_threat_details(self) -> None:
         """Return the Threats destination to its list state."""
@@ -1248,6 +1294,12 @@ class AutoGuardUIController:
         """Return only user-facing list data for currently isolated files."""
         items = tuple(self.services.quarantine.list_quarantined_items())
         isolated = tuple(item for item in items if item.state is QuarantineState.QUARANTINED)
+        verified_count = sum(item.integrity_status is QuarantineIntegrityStatus.VERIFIED for item in isolated)
+        verification_issues = sum(
+            item.integrity_status is QuarantineIntegrityStatus.FAILED
+            and getattr(item, "deleted_at", None) is None
+            for item in items
+        )
         rows: list[dict[str, Any]] = []
         for item in isolated:
             details = self.services.incidents.get_incident(item.incident_id)
@@ -1275,7 +1327,8 @@ class AutoGuardUIController:
                 "threat_status": threat_status,
                 "threat_status_key": threat_status_key,
             })
-        return {"isolated_count": len(isolated), "items": rows}
+        return {"isolated_count": len(isolated), "verified_count": verified_count,
+                "verification_issues": verification_issues, "items": rows}
 
     @property
     def selected_quarantine_ref(self) -> str | None:
@@ -1361,14 +1414,65 @@ class AutoGuardUIController:
         }
 
     # ---------- Unified Activity read model ----------
-    def request_activity_view(self, request_id: int, *, session_id=None, page=0, filters=None) -> None:
+    def set_activity_view_active(self, active: bool) -> None:
+        with self._lock:
+            self._activity_view_active = bool(active)
+            if not active:
+                self._activity_change_pending = None
+                if self._activity_change_timer is not None:
+                    self._activity_change_timer.cancel()
+                    self._activity_change_timer = None
+
+    def _on_scan_history_changed(self, session_id, recorded_at) -> None:
+        with self._lock:
+            if not self._activity_view_active:
+                return
+            local_date = recorded_at.astimezone().date().isoformat()
+            if self._activity_change_pending is None:
+                self._activity_change_pending = {"session_id": session_id, "local_dates": set()}
+            self._activity_change_pending["session_id"] = session_id
+            self._activity_change_pending["local_dates"].add(local_date)
+            elapsed = time.monotonic() - self._activity_last_change_notice
+            if elapsed >= 0.75 and self._activity_change_timer is None:
+                self._activity_last_change_notice = time.monotonic()
+                pending = self._activity_change_pending
+                self._activity_change_pending = None
+                publish_now = True
+            else:
+                publish_now = False
+                if self._activity_change_timer is None:
+                    delay = max(0.05, 0.75 - elapsed)
+                    timer = threading.Timer(delay, self._flush_scan_history_changed)
+                    timer.daemon = True
+                    self._activity_change_timer = timer
+                    timer.start()
+        if publish_now:
+            self._publish_activity_change(pending)
+
+    def _publish_activity_change(self, pending) -> None:
+        dates = tuple(sorted(pending["local_dates"]))
+        self.bus.publish("scan_history_changed", session_id=pending["session_id"],
+                         local_date=dates[-1] if dates else None, local_dates=dates)
+
+    def _flush_scan_history_changed(self) -> None:
+        with self._lock:
+            self._activity_change_timer = None
+            if not self._activity_view_active or self._activity_change_pending is None:
+                return
+            pending = self._activity_change_pending
+            self._activity_change_pending = None
+            self._activity_last_change_notice = time.monotonic()
+        self._publish_activity_change(pending)
+
+    def request_activity_view(self, request_id: int, *, session_id=None, local_date=None,
+                              page=0, page_size=50, filters=None) -> None:
         """One reader with a latest-request slot; no overlapping Activity queries.
 
         Workers publish only plain data. The Tk page validates the request token
         before rendering, including failures from a previously selected session.
         """
         with self._lock:
-            self._activity_pending = (request_id, session_id, page, dict(filters or {}))
+            self._activity_pending = (request_id, session_id, local_date, page, page_size, dict(filters or {}))
             if self._activity_reader_running:
                 return
             self._activity_reader_running = True
@@ -1381,11 +1485,21 @@ class AutoGuardUIController:
                     if request is None:
                         self._activity_reader_running = False
                         return
-                token, selected, number, selected_filters = request
+                token, selected, selected_date, number, size, selected_filters = request
                 try:
                     history = self.services.scanner.history
-                    result = (history.result_page(selected, page=number) if selected else
-                              history.session_page(page=number, **selected_filters))
+                    if selected:
+                        result = history.result_page(selected, page=number)
+                    elif selected_date:
+                        result = history.daily_results_page(
+                            selected_date, page=number, page_size=size, **selected_filters
+                        )
+                    else:
+                        # Kept for compatibility with existing non-UI adapters.
+                        if hasattr(history, "scan_date_page"):
+                            result = history.scan_date_page(page=number, page_size=size)
+                        else:
+                            result = history.session_page(page=number, **selected_filters)
                     self.bus.publish("activity_view_data", request_id=token, result=result)
                 except Exception as error:
                     self.bus.publish("activity_view_error", request_id=token,
@@ -1806,14 +1920,15 @@ class AutoGuardUIController:
     def _new_progress_state() -> dict[str, Any]:
         return {
             "discovered": 0, "processed": 0, "last_emit": 0.0,
-            "scanned": 0, "skipped": 0, "suspicious": 0,
+            "scanned": 0, "safe": 0, "skipped": 0, "suspicious": 0,
             "dangerous": 0, "errors": 0, "last_path": "",
-            "result_emitted": False,
+            "result_emitted": False, "tracker": ScanProgress.start(),
         }
 
     def _emit_scan_progress(
         self, state: dict[str, Any], *, task: str, result: ScanResult | None = None,
         path: str = "", force: bool = False, discovered_only: bool = False,
+        phase: str | None = None, total: int | None = None,
     ) -> None:
         """Throttle presentation updates without throttling the scanner itself.
 
@@ -1824,9 +1939,19 @@ class AutoGuardUIController:
         now = time.monotonic()
         if path:
             state["last_path"] = path
+        tracker: ScanProgress = state["tracker"]
+        if phase is not None:
+            tracker.set_phase(phase, total)
+        if total is not None and phase is None:
+            tracker.total = max(int(total), tracker.processed)
         if result is not None:
             state["processed"] += 1
             state["discovered"] = max(state["discovered"], state["processed"] )
+            tracker.record_result(
+                size_bytes=(result.observation.size_bytes if result.observation else 0),
+            )
+            if tracker.total is not None:
+                tracker.total = max(tracker.total, tracker.processed)
             if result.status is ScanStatus.SCANNED:
                 state["scanned"] += 1
             elif result.status is ScanStatus.ERROR:
@@ -1839,6 +1964,10 @@ class AutoGuardUIController:
             elif detection is DetectionStatus.HIGH_CONFIDENCE:
                 state["dangerous"] += 1
                 force = True
+            elif result.status is ScanStatus.SCANNED:
+                state["safe"] += 1
+        elif discovered_only and tracker.total is not None:
+            tracker.total = max(tracker.total, state["discovered"])
         with self._lock:
             if self._ui_scan_status is not None and self._current_scan_task == task:
                 self._ui_scan_status["files_checked"] = state["processed"]
@@ -1850,14 +1979,16 @@ class AutoGuardUIController:
         if not (force or first or now - state["last_emit"] >= 0.125):
             return
         state["last_emit"] = now
+        metrics = tracker.snapshot(now)
         payload = {
             "path": state["last_path"],
             "processed": state["processed"],
             "discovered": state["discovered"],
-            "progress": (state["processed"] / state["discovered"]) if state["discovered"] else 0.0,
+            "progress": (state["processed"] / tracker.total) if tracker.total else None,
+            **metrics,
             "task": task,
             "counts": {key: state[key] for key in (
-                "scanned", "skipped", "suspicious", "dangerous", "errors"
+                "scanned", "safe", "skipped", "suspicious", "dangerous", "errors"
             )},
         }
         if discovered_only and result is None:
@@ -1874,6 +2005,16 @@ class AutoGuardUIController:
             self.bus.publish("scan_result", **payload)
         else:
             self.bus.publish("scan_discovered", entry_kind="file", **payload)
+
+    def _scan_phase_callback(self, state: dict[str, Any], task: str):
+        def on_phase(phase: str, total: int | None) -> None:
+            completed_total = state.get("completed_total", 0)
+            if total is not None and phase in ("scanning", "finalizing"):
+                total += completed_total
+            self._emit_scan_progress(
+                state, task=task, phase=phase, total=total, force=True,
+            )
+        return on_phase
 
     def start_scan(self, path: str | Path, *, scan_type: ScanType = ScanType.MANUAL) -> None:
         target = Path(path)
@@ -1904,6 +2045,7 @@ class AutoGuardUIController:
                 interrupt_check=cancel_event.is_set,
                 on_result=on_result,
                 on_discovered=on_discovered,
+                on_phase=self._scan_phase_callback(state, task),
             )
             # Ensure the visible counters land on their exact final values even
             # when the last files were inside the throttle window.
@@ -1913,6 +2055,53 @@ class AutoGuardUIController:
             return summary
 
         self._submit(task, scan, "scan_completed")
+
+    def start_custom_scan(self, paths) -> bool:
+        """Run selected files and folders through one scanner session and task."""
+        if isinstance(paths, (str, bytes)):
+            raise ValueError("Provide a collection of selected file and folder paths.")
+        targets = tuple(Path(path) for path in paths if str(path).strip())
+        if not targets:
+            return False
+        scanner = self.services.scanner
+        scan_many = getattr(scanner, "scan_many", None)
+        if not callable(scan_many):
+            self.bus.publish(
+                "scan_rejected", task="custom-scan", active_task="scanner-unavailable",
+                reason="This scanner does not support a coherent multi-target session.",
+            )
+            return False
+
+        task = "custom-scan"
+        cancel_event = self._begin_ui_scan(task)
+        if cancel_event is None:
+            return False
+        self.bus.publish(
+            "scan_started", path=f"{len(targets):,} selected targets",
+            scan_type=ScanType.MANUAL.value, target_count=len(targets), task=task,
+        )
+
+        def run_batch():
+            state = self._new_progress_state()
+
+            def on_discovered(path: str, kind: str) -> None:
+                state["discovered"] += 1
+                self._emit_scan_progress(state, task=task, path=path, discovered_only=True)
+
+            def on_result(result: ScanResult) -> None:
+                self._emit_scan_progress(state, task=task, result=result, path=result.path)
+
+            summary = scan_many(
+                targets, ScanSource.MANUAL, scan_type=ScanType.MANUAL,
+                interrupt_check=cancel_event.is_set,
+                on_result=on_result, on_discovered=on_discovered,
+                on_phase=self._scan_phase_callback(state, task),
+            )
+            self._emit_scan_progress(state, task=task, path=state["last_path"], force=True)
+            return summary
+
+        self._submit(task, run_batch, "scan_completed")
+        return True
 
     def start_quick_scan(self) -> None:
         self._start_path_batch("quick", self.services.scheduler.quick_paths, ScanType.QUICK)
@@ -1954,8 +2143,10 @@ class AutoGuardUIController:
                         interrupt_check=cancel_event.is_set,
                         on_result=on_result,
                         on_discovered=on_discovered,
+                        on_phase=self._scan_phase_callback(state, task),
                     )
                 )
+                state["completed_total"] = state["tracker"].processed
             self._emit_scan_progress(
                 state, task=task, path=state["last_path"], force=True
             )
