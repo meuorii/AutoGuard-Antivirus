@@ -115,24 +115,24 @@ class ThreatsPage(BasePage):
         )
         card.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
         card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             card, text="Threat data could not be loaded",
-            font=(theme.FONT, 15, "bold"), text_color=theme.TEXT, anchor="w",
+            font=theme.font("card", "bold", theme.FONT), text_color=theme.TEXT, anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(15, 4), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             card, text="AutoGuard is still protecting your computer. Try loading this view again.",
-            font=(theme.FONT, 10), text_color=theme.TEXT_MUTED, anchor="w",
+            font=theme.font("body", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w",
             justify="left", wraplength=760,
         ).grid(row=1, column=0, padx=16, sticky="ew")
-        ctk.CTkLabel(
-            card, text=error, font=(theme.FONT, 9), text_color=theme.TEXT_DIM,
+        theme.Label(
+            card, text=error, font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT_DIM,
             anchor="w", justify="left", wraplength=760,
         ).grid(row=2, column=0, padx=16, pady=(6, 10), sticky="ew")
         retry = (
             (lambda: self.controller.load_threat_details(self._detail_ref))
             if details else self.controller.load_threats
         )
-        ctk.CTkButton(
+        theme.Button(
             card, text="Retry", width=90, height=30, command=retry,
             fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
             text_color=theme.BG,
@@ -205,10 +205,10 @@ class ThreatsPage(BasePage):
         ).grid(row=row, column=0, padx=8, pady=(4, 12), sticky="ew")
 
     def _no_history(self, row: int) -> None:
-        ctk.CTkLabel(
+        theme.Label(
             self.body,
             text="No contained or resolved threats have been recorded yet.",
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             anchor="w",
         ).grid(row=row, column=0, padx=12, pady=(0, 18), sticky="w")
@@ -237,10 +237,10 @@ class ThreatsPage(BasePage):
         top = ctk.CTkFrame(card, fg_color="transparent")
         top.grid(row=0, column=0, columnspan=2, padx=16, pady=(14, 3), sticky="ew")
         top.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             top,
             text=item.get("name", "Threat"),
-            font=(theme.FONT, 14, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew")
@@ -250,10 +250,10 @@ class ThreatsPage(BasePage):
             item.get("status_key", "idle"),
         ).grid(row=0, column=1, padx=(10, 0), sticky="e")
 
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text=item.get("location", "Location unavailable"),
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
             justify="left",
@@ -264,16 +264,16 @@ class ThreatsPage(BasePage):
         copies = int(item.get("matching_copies", 0) or 0)
         if copies:
             meta_parts.append(f"{copies:,} matching {'copy' if copies == 1 else 'copies'} found")
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text="  •  ".join(meta_parts),
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             anchor="w",
         ).grid(row=2, column=0, padx=16, pady=(6, 14), sticky="w")
 
         threat_ref = item.get("threat_ref")
-        ctk.CTkButton(
+        theme.Button(
             card,
             text=item.get("action", "View details"),
             width=98,

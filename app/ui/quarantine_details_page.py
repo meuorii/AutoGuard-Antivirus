@@ -49,7 +49,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
         return card
 
     def _build(self, on_back, on_verify, on_restore, on_delete) -> None:
-        ctk.CTkButton(
+        theme.Button(
             self,
             text="← Back to Quarantine",
             width=150,
@@ -62,24 +62,24 @@ class QuarantineDetailsView(ctk.CTkFrame):
         ).grid(row=0, column=0, padx=8, pady=(2, 10), sticky="w")
 
         header = self._card(1)
-        ctk.CTkLabel(
+        theme.Label(
             header,
             text=self._data.get("name", "Isolated file"),
-            font=(theme.FONT, 21, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, padx=18, pady=(17, 3), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             header,
             text=f"Contained {self._data.get('contained', 'time unavailable')}",
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
         ).grid(row=1, column=0, padx=18, pady=(0, 3), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             header,
             text=self._data.get("original_location", "Original location unavailable"),
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             anchor="w",
             justify="left",
@@ -87,10 +87,10 @@ class QuarantineDetailsView(ctk.CTkFrame):
         ).grid(row=2, column=0, padx=18, pady=(0, 16), sticky="ew")
 
         integrity = self._card(2)
-        ctk.CTkLabel(
+        theme.Label(
             integrity,
             text="Integrity",
-            font=(theme.FONT, 16, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, padx=18, pady=(16, 8), sticky="ew")
@@ -100,18 +100,18 @@ class QuarantineDetailsView(ctk.CTkFrame):
         verification = ctk.CTkFrame(integrity, fg_color="transparent")
         verification.grid(row=1, column=0, padx=18, pady=(0, 8), sticky="ew")
         verification.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             verification,
             text="Hash verification",
             width=150,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
+        theme.Label(
             verification,
             text=self._data.get("hash_verification", "Not verified yet"),
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             text_color=color,
             fg_color=background,
             corner_radius=6,
@@ -130,7 +130,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
             "Last verified",
             self._data.get("last_verified", "Not verified yet"),
         )
-        ctk.CTkButton(
+        theme.Button(
             integrity,
             text="Verify integrity",
             width=118,
@@ -141,10 +141,10 @@ class QuarantineDetailsView(ctk.CTkFrame):
         ).grid(row=4, column=0, padx=18, pady=(4, 16), sticky="w")
 
         details = self._card(3)
-        ctk.CTkLabel(
+        theme.Label(
             details,
             text="File details",
-            font=(theme.FONT, 16, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, padx=18, pady=(16, 8), sticky="ew")
@@ -176,7 +176,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
 
         actions = ctk.CTkFrame(details, fg_color="transparent")
         actions.grid(row=final_row, column=0, padx=18, pady=(10, 16), sticky="ew")
-        ctk.CTkButton(
+        theme.Button(
             actions,
             text="Restore",
             width=90,
@@ -187,7 +187,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
             state="normal" if self._data.get("can_restore") else "disabled",
             command=on_restore,
         ).pack(side="left")
-        ctk.CTkButton(
+        theme.Button(
             actions,
             text="Delete",
             width=84,
@@ -211,18 +211,18 @@ class QuarantineDetailsView(ctk.CTkFrame):
         block = ctk.CTkFrame(parent, fg_color="transparent")
         block.grid(row=row, column=0, padx=18, pady=(2, 6), sticky="ew")
         block.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             block,
             text=label,
             width=170,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="nw",
         ).grid(row=0, column=0, padx=(0, 14), sticky="nw")
-        ctk.CTkLabel(
+        theme.Label(
             block,
             text=value,
-            font=(theme.FONT_MONO if technical else theme.FONT, 9),
+            font=theme.font("secondary", family=theme.FONT_MONO if technical else theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
             justify="left",

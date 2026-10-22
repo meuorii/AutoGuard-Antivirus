@@ -165,8 +165,8 @@ class QuarantinePage(BasePage):
         box = ctk.CTkFrame(parent, fg_color=background, border_width=1, border_color=color, corner_radius=theme.RADIUS_SMALL)
         box.grid(row=row, column=0, padx=8, pady=(2, 10), sticky="ew")
         box.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(box, text=self._notice.get("title", "Update"), font=(theme.FONT, 11, "bold"), text_color=color, anchor="w").grid(row=0, column=0, padx=14, pady=(10, 2), sticky="ew")
-        ctk.CTkLabel(box, text=self._notice.get("message", ""), font=(theme.FONT, 9), text_color=theme.TEXT, anchor="w", justify="left", wraplength=800).grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
+        theme.Label(box, text=self._notice.get("title", "Update"), font=theme.font("body", "bold", theme.FONT), text_color=color, anchor="w").grid(row=0, column=0, padx=14, pady=(10, 2), sticky="ew")
+        theme.Label(box, text=self._notice.get("message", ""), font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT, anchor="w", justify="left", wraplength=800).grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
         return row + 1
 
     def _render_list(self, data: dict):
@@ -177,17 +177,17 @@ class QuarantinePage(BasePage):
         summary = ctk.CTkFrame(self.body, fg_color="transparent")
         summary.grid(row=row, column=0, padx=8, pady=(2, 12), sticky="ew")
         summary.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             summary,
             text=f"{count:,} {'file' if count == 1 else 'files'} safely isolated",
-            font=(theme.FONT, 18, "bold"),
+            font=theme.font("section", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
+        theme.Label(
             summary,
             text="Isolated files are kept separate from their original locations until you restore or delete them.",
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
             justify="left",
@@ -199,27 +199,27 @@ class QuarantinePage(BasePage):
         if not items:
             empty = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
             empty.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
-            ctk.CTkLabel(empty, text="No files are currently isolated", font=(theme.FONT, 14, "bold"), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=18, pady=(18, 4), sticky="w")
-            ctk.CTkLabel(empty, text="Quarantine will show files here when AutoGuard successfully isolates them.", font=(theme.FONT, 10), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=18, pady=(0, 18), sticky="w")
+            theme.Label(empty, text="No files are currently isolated", font=theme.font("card", "bold", theme.FONT), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=18, pady=(18, 4), sticky="w")
+            theme.Label(empty, text="Quarantine will show files here when AutoGuard successfully isolates them.", font=theme.font("body", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=18, pady=(0, 18), sticky="w")
             return
 
         for item in items:
             card = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
             card.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
             card.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(card, text=item.get("name", "Isolated file"), font=(theme.FONT, 13, "bold"), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=16, pady=(14, 2), sticky="ew")
-            ctk.CTkLabel(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=(theme.FONT, 9), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=16, sticky="ew")
-            ctk.CTkLabel(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=(theme.FONT, 9), text_color=theme.TEXT_DIM, anchor="w", justify="left", wraplength=650).grid(row=2, column=0, padx=16, pady=(2, 12), sticky="ew")
+            theme.Label(card, text=item.get("name", "Isolated file"), font=theme.font("card", "bold", theme.FONT), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=16, pady=(14, 2), sticky="ew")
+            theme.Label(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=16, sticky="ew")
+            theme.Label(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT_DIM, anchor="w", justify="left", wraplength=650).grid(row=2, column=0, padx=16, pady=(2, 12), sticky="ew")
 
             StatusBadge(
                 card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")
-            ).grid(row=0, column=1, padx=(8, 16), pady=(14, 2), sticky="e")
+            ).grid(row=3, column=0, padx=16, pady=(0, 8), sticky="w")
             actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.grid(row=1, column=1, rowspan=2, padx=13, pady=(4, 12), sticky="e")
+            actions.grid(row=4, column=0, padx=13, pady=(4, 12), sticky="w")
             ref = item.get("item_ref")
-            ctk.CTkButton(actions, text="View", width=70, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref: self.controller.open_quarantine_details(q)).pack(side="left", padx=3)
-            ctk.CTkButton(actions, text="Restore", width=76, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref, path=item.get("original_location", ""): self._restore(q, path)).pack(side="left", padx=3)
-            ctk.CTkButton(actions, text="Delete", width=70, height=28, fg_color=theme.DANGER_DARK, hover_color=theme.DANGER, text_color=theme.DANGER, command=lambda q=ref, name=item.get("name", "this file"): self._delete(q, name)).pack(side="left", padx=3)
+            theme.Button(actions, text="View", width=70, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref: self.controller.open_quarantine_details(q)).pack(side="left", padx=3)
+            theme.Button(actions, text="Restore", width=76, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref, path=item.get("original_location", ""): self._restore(q, path)).pack(side="left", padx=3)
+            theme.Button(actions, text="Delete", width=70, height=28, fg_color=theme.DANGER_DARK, hover_color=theme.DANGER, text_color=theme.DANGER, command=lambda q=ref, name=item.get("name", "this file"): self._delete(q, name)).pack(side="left", padx=3)
             row += 1
 
     def _render_details(self, data: dict):

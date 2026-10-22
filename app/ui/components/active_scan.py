@@ -65,31 +65,31 @@ class ActiveScanPanel(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
-        self.scan_type_label = ctk.CTkLabel(
+        self.scan_type_label = theme.Label(
             header,
             text="Quick Scan",
             text_color=theme.TEXT,
-            font=(theme.FONT, 22, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
             anchor="w",
         )
         self.scan_type_label.grid(row=0, column=0, sticky="w")
-        self.state_badge = ctk.CTkLabel(
+        self.state_badge = theme.Label(
             header,
             text="SCANNING",
             text_color=theme.ACCENT,
             fg_color=theme.ACCENT_DARK,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             corner_radius=theme.RADIUS_SMALL,
             padx=10,
             pady=4,
         )
         self.state_badge.grid(row=0, column=1, padx=(12, 0), sticky="e")
 
-        self.message_label = ctk.CTkLabel(
+        self.message_label = theme.Label(
             self,
             text="Checking your files...",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 11),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         )
         self.message_label.grid(row=1, column=0, pady=(4, 18), sticky="ew")
@@ -107,18 +107,18 @@ class ActiveScanPanel(ctk.CTkFrame):
         progress_head = ctk.CTkFrame(progress_card, fg_color="transparent")
         progress_head.grid(row=0, column=0, padx=18, pady=(18, 8), sticky="ew")
         progress_head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             progress_head,
             text="Scan progress",
             text_color=theme.TEXT,
-            font=(theme.FONT, 12, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
-        self.percent_label = ctk.CTkLabel(
+        self.percent_label = theme.Label(
             progress_head,
             text="Starting...",
             text_color=theme.ACCENT,
-            font=(theme.FONT, 11, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             anchor="e",
         )
         self.percent_label.grid(row=0, column=1, sticky="e")
@@ -137,52 +137,52 @@ class ActiveScanPanel(ctk.CTkFrame):
         metrics = ctk.CTkFrame(progress_card, fg_color="transparent")
         metrics.grid(row=2, column=0, padx=18, pady=(18, 14), sticky="ew")
         metrics.grid_columnconfigure((0, 1), weight=1)
-        self.files_checked_value = ctk.CTkLabel(
+        self.files_checked_value = theme.Label(
             metrics,
             text="0",
             text_color=theme.TEXT,
-            font=(theme.FONT, 28, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
             anchor="w",
         )
         self.files_checked_value.grid(row=0, column=0, sticky="w")
-        self.threats_value = ctk.CTkLabel(
+        self.threats_value = theme.Label(
             metrics,
             text="0",
             text_color=theme.TEXT,
-            font=(theme.FONT, 28, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
             anchor="w",
         )
         self.threats_value.grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(
+        theme.Label(
             metrics,
             text="Files checked",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         ).grid(row=1, column=0, sticky="w")
-        ctk.CTkLabel(
+        theme.Label(
             metrics,
             text="Threats found",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         ).grid(row=1, column=1, sticky="w")
 
         current = ctk.CTkFrame(progress_card, fg_color=theme.SURFACE_ALT, corner_radius=theme.RADIUS_SMALL)
         current.grid(row=3, column=0, padx=18, pady=(0, 16), sticky="ew")
         current.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             current,
             text="Currently checking",
             text_color=theme.TEXT_DIM,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=0, padx=12, pady=(9, 2), sticky="ew")
-        self.current_path_label = ctk.CTkLabel(
+        self.current_path_label = theme.Label(
             current,
             text="Preparing scan...",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
             justify="left",
             wraplength=760,
@@ -192,7 +192,7 @@ class ActiveScanPanel(ctk.CTkFrame):
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=3, column=0, pady=(12, 0), sticky="ew")
         controls.grid_columnconfigure(0, weight=1)
-        self.details_button = ctk.CTkButton(
+        self.details_button = theme.Button(
             controls,
             text="More details  ▾",
             command=self._toggle_details,
@@ -203,11 +203,11 @@ class ActiveScanPanel(ctk.CTkFrame):
             border_width=1,
             border_color=theme.BORDER,
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             corner_radius=theme.RADIUS_SMALL,
         )
         self.details_button.grid(row=0, column=0, sticky="w")
-        self.stop_button = ctk.CTkButton(
+        self.stop_button = theme.Button(
             controls,
             text="Stop Scan",
             command=self._request_stop,
@@ -218,7 +218,7 @@ class ActiveScanPanel(ctk.CTkFrame):
             border_width=1,
             border_color=theme.DANGER,
             text_color=theme.DANGER,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             corner_radius=theme.RADIUS_SMALL,
         )
         self.stop_button.grid(row=0, column=1, sticky="e")
@@ -231,7 +231,7 @@ class ActiveScanPanel(ctk.CTkFrame):
             corner_radius=theme.RADIUS,
         )
         self.details_frame.grid_columnconfigure((0, 1, 2), weight=1)
-        self.detail_values: dict[str, ctk.CTkLabel] = {}
+        self.detail_values: dict[str, theme.Label] = {}
         details = (
             ("discovered", "Discovered"),
             ("processed", "Processed"),
@@ -243,19 +243,19 @@ class ActiveScanPanel(ctk.CTkFrame):
         for index, (key, label) in enumerate(details):
             row = (index // 3) * 2
             column = index % 3
-            value = ctk.CTkLabel(
+            value = theme.Label(
                 self.details_frame,
                 text="0",
                 text_color=theme.TEXT,
-                font=(theme.FONT, 14, "bold"),
+                font=theme.font("card", "bold", theme.FONT),
                 anchor="w",
             )
             value.grid(row=row, column=column, padx=14, pady=(12, 0), sticky="ew")
-            ctk.CTkLabel(
+            theme.Label(
                 self.details_frame,
                 text=label,
                 text_color=theme.TEXT_MUTED,
-                font=(theme.FONT, 9),
+                font=theme.font("secondary", "normal", theme.FONT),
                 anchor="w",
             ).grid(row=row + 1, column=column, padx=14, pady=(0, 12), sticky="ew")
             self.detail_values[key] = value

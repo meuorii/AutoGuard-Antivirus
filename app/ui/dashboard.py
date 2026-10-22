@@ -31,26 +31,26 @@ class _SummaryBlock(ctk.CTkFrame):
             corner_radius=theme.RADIUS,
         )
         self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=label,
             text_color=theme.TEXT_DIM,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(14, 5), sticky="ew")
-        self.value = ctk.CTkLabel(
+        self.value = theme.Label(
             self,
             text="Checking…",
             text_color=theme.TEXT,
-            font=(theme.FONT, 15, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             anchor="w",
         )
         self.value.grid(row=1, column=0, padx=16, sticky="ew")
-        self.detail = ctk.CTkLabel(
+        self.detail = theme.Label(
             self,
             text="",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 10),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         )
         self.detail.grid(row=2, column=0, padx=16, pady=(3, 14), sticky="ew")
@@ -66,21 +66,21 @@ class _ProtectionRow(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         text = ctk.CTkFrame(self, fg_color="transparent")
         text.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             text,
             text=label,
             text_color=theme.TEXT,
-            font=(theme.FONT, 11, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             anchor="w",
         ).pack(anchor="w")
-        ctk.CTkLabel(
+        theme.Label(
             text,
             text=description,
             text_color=theme.TEXT_DIM,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             anchor="w",
         ).pack(anchor="w", pady=(2, 0))
-        self.state = ctk.CTkLabel(
+        self.state = theme.Label(
             self,
             text="Checking",
             width=104,
@@ -88,7 +88,7 @@ class _ProtectionRow(ctk.CTkFrame):
             corner_radius=7,
             fg_color=theme.SURFACE_ALT,
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
         )
         self.state.grid(row=0, column=1, padx=(16, 0), sticky="e")
 
@@ -112,32 +112,32 @@ class _ActivityRow(ctk.CTkFrame):
             "danger": theme.DANGER,
             "success": theme.SUCCESS,
         }.get(tone, theme.ACCENT)
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text="●",
             width=18,
             text_color=color,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
         ).grid(row=0, column=0, rowspan=2, padx=(0, 8), sticky="n")
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=title,
             text_color=theme.TEXT,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=1, sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=detail,
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             anchor="w",
         ).grid(row=1, column=1, pady=(2, 0), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=_format_when(when),
             text_color=theme.TEXT_DIM,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             anchor="e",
         ).grid(row=0, column=2, rowspan=2, padx=(16, 0), sticky="e")
 
@@ -172,7 +172,7 @@ class DashboardPage(BasePage):
         )
         self.status_panel.grid_columnconfigure(1, weight=1)
 
-        self.status_icon = ctk.CTkLabel(
+        self.status_icon = theme.Label(
             self.status_panel,
             text="…",
             width=52,
@@ -180,28 +180,28 @@ class DashboardPage(BasePage):
             corner_radius=12,
             fg_color=theme.SURFACE_ALT,
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 24, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
         )
         self.status_icon.grid(row=0, column=0, rowspan=2, padx=(20, 14), pady=20)
 
-        self.status_title = ctk.CTkLabel(
+        self.status_title = theme.Label(
             self.status_panel,
             text="Checking protection",
             text_color=theme.TEXT,
-            font=(theme.FONT, 20, "bold"),
+            font=theme.font("section", "bold", theme.FONT),
             anchor="w",
         )
         self.status_title.grid(row=0, column=1, padx=(0, 16), pady=(20, 2), sticky="sw")
-        self.status_message = ctk.CTkLabel(
+        self.status_message = theme.Label(
             self.status_panel,
             text="AutoGuard is checking protection services.",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 11),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         )
         self.status_message.grid(row=1, column=1, padx=(0, 16), pady=(0, 20), sticky="nw")
 
-        self.quick_scan = ctk.CTkButton(
+        self.quick_scan = theme.Button(
             self.status_panel,
             text="Run Quick Scan",
             width=142,
@@ -210,7 +210,7 @@ class DashboardPage(BasePage):
             fg_color=theme.ACCENT,
             hover_color=theme.ACCENT_HOVER,
             text_color=theme.BG,
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             command=self.controller.start_quick_scan,
         )
         self.quick_scan.grid(row=0, column=2, rowspan=2, padx=20, pady=20, sticky="e")
@@ -221,11 +221,11 @@ class DashboardPage(BasePage):
             block.grid(row=1, column=col, padx=8, pady=(0, 14), sticky="nsew")
             self.summaries[key] = block
 
-        protection_header = ctk.CTkLabel(
+        protection_header = theme.Label(
             self.body,
             text="Protection",
             text_color=theme.TEXT,
-            font=(theme.FONT, 15, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             anchor="w",
         )
         protection_header.grid(row=2, column=0, columnspan=3, padx=8, pady=(10, 7), sticky="ew")
@@ -262,14 +262,14 @@ class DashboardPage(BasePage):
         activity_header = ctk.CTkFrame(self.body, fg_color="transparent")
         activity_header.grid(row=4, column=0, columnspan=3, padx=8, pady=(24, 7), sticky="ew")
         activity_header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             activity_header,
             text="Recent Activity",
             text_color=theme.TEXT,
-            font=(theme.FONT, 15, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(
+        theme.Button(
             activity_header,
             text="View activity",
             width=92,
@@ -278,7 +278,7 @@ class DashboardPage(BasePage):
             fg_color="transparent",
             hover_color=theme.SURFACE_HOVER,
             text_color=theme.ACCENT,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             command=lambda: self.controller.navigate_to("activity"),
         ).grid(row=0, column=1, sticky="e")
 
@@ -360,11 +360,11 @@ class DashboardPage(BasePage):
             child.destroy()
         activities = data["recent_activity"]
         if not activities:
-            ctk.CTkLabel(
+            theme.Label(
                 self.recent,
                 text="No recent activity yet.",
                 text_color=theme.TEXT_DIM,
-                font=(theme.FONT, 10),
+                font=theme.font("body", "normal", theme.FONT),
             ).grid(row=0, column=0, padx=16, pady=20, sticky="w")
             return
         for index, activity in enumerate(activities):

@@ -182,17 +182,17 @@ class ActivityPage(BasePage):
             text_color=theme.TEXT,
             border_width=1,
             corner_radius=theme.RADIUS_SMALL,
-            font=(theme.FONT, 12, "bold"),
-            height=34,
+            font=theme.font("body", "bold", theme.FONT),
+            height=44,
         )
         segmented.grid(row=0, column=0, sticky="w")
         segmented.set(self._filter)
-        ctk.CTkButton(
+        theme.Button(
             bar,
             text="Refresh",
             width=96,
             height=34,
-            font=(theme.FONT, 12),
+            font=theme.font("body", "normal", theme.FONT),
             fg_color=theme.SURFACE,
             hover_color=theme.SURFACE_HOVER,
             border_width=1,
@@ -253,10 +253,10 @@ class ActivityPage(BasePage):
             group = event.get("date_group", "Earlier")
             if group != current_group:
                 current_group = group
-                ctk.CTkLabel(
+                theme.Label(
                     self.body,
                     text=group,
-                    font=(theme.FONT, 17, "bold"),
+                    font=theme.font("section", "bold", theme.FONT),
                     text_color=theme.TEXT,
                     anchor="w",
                 ).grid(row=row_index, column=0, padx=10, pady=(15 if row_index > 1 else 2, 5), sticky="ew")
@@ -281,55 +281,55 @@ class ActivityPage(BasePage):
         card.grid_columnconfigure(1, weight=1)
 
         color = _TONE_COLORS.get(event.get("tone"), theme.INFO)
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text="●",
-            font=(theme.FONT, 16, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             text_color=color,
             width=28,
         ).grid(row=0, column=0, rowspan=2, padx=(14, 6), pady=12, sticky="n")
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text=event.get("title", "Activity recorded"),
-            font=(theme.FONT, 14, "bold"),
+            font=theme.font("card", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=1, padx=(0, 8), pady=(11, 2), sticky="ew")
         detection_number = event.get("detection_number")
         if detection_number is not None:
-            ctk.CTkLabel(
+            theme.Label(
                 card,
                 text=f"DETECTION #{int(detection_number):03d}",
-                font=(theme.FONT, 10, "bold"),
+                font=theme.font("body", "bold", theme.FONT),
                 text_color=theme.ACCENT,
                 fg_color=theme.SURFACE_HOVER,
                 corner_radius=theme.RADIUS_SMALL,
             ).grid(row=0, column=2, padx=(4, 6), pady=(9, 2), sticky="e", ipadx=6, ipady=2)
 
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text=event.get("time", "Time unavailable"),
-            font=(theme.FONT, 12),
+            font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             anchor="e",
         ).grid(row=0, column=3, padx=(6, 14), pady=(11, 2), sticky="e")
 
         detail = event.get("detail", "")
         if detail:
-            ctk.CTkLabel(
+            theme.Label(
                 card,
                 text=detail,
-                font=(theme.FONT, 12),
+                font=theme.font("body", "normal", theme.FONT),
                 text_color=theme.TEXT_MUTED,
                 anchor="w",
                 justify="left",
                 wraplength=860,
             ).grid(row=1, column=1, columnspan=3, padx=(0, 14), pady=(0, 11), sticky="ew")
         else:
-            ctk.CTkLabel(
+            theme.Label(
                 card,
                 text=event.get("category", "Activity"),
-                font=(theme.FONT, 12),
+                font=theme.font("body", "normal", theme.FONT),
                 text_color=theme.TEXT_DIM,
                 anchor="w",
             ).grid(row=1, column=1, columnspan=3, padx=(0, 14), pady=(0, 11), sticky="w")

@@ -84,6 +84,8 @@ class MainWindow(ctk.CTk):
     ):
         super().__init__()
         ctk.set_appearance_mode("dark")
+        from app.ui.preferences import load_text_size
+        theme.set_text_size(load_text_size(services.config.data_dir))
         self.title("AutoGuard")
         self.geometry("1320x820")
         self.minsize(1080, 680)

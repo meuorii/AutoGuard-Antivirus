@@ -10,6 +10,7 @@ import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
+from app.ui.preferences import TEXT_SIZES, save_text_size
 
 
 class SettingsPage(BasePage):
@@ -90,12 +91,33 @@ class SettingsPage(BasePage):
         if self._error:
             row = self._feedback_card(row, "Setting could not be applied", self._error, tone="danger")
 
+        row = self._accessibility_section(row)
         row = self._protection_section(row)
         row = self._schedule_section(row)
         row = self._scan_preferences_section(row)
         row = self._quarantine_section(row)
         row = self._application_section(row)
         self._advanced_section(row)
+
+    def _accessibility_section(self, row: int) -> int:
+        card = self._section(row, "Accessibility", "Text size applies immediately across AutoGuard.")
+        ctk.CTkOptionMenu(
+            card, values=list(TEXT_SIZES), variable=ctk.StringVar(value=theme.text_size()),
+            font=theme.font("button"), dropdown_font=theme.font("button"),
+            height=44, width=220, command=self._set_text_size,
+            fg_color=theme.ACCENT_DARK, button_color=theme.SURFACE_HOVER,
+            text_color=theme.TEXT,
+        ).grid(row=2, column=0, padx=16, pady=(6, 16), sticky="w")
+        return row + 1
+
+    def _set_text_size(self, value: str) -> None:
+        try:
+            save_text_size(self.controller.services.config.data_dir, value)
+        except OSError as error:
+            self._error = f"Text size could not be saved: {error}"
+            self._render()
+            return
+        theme.set_text_size(value)
 
     def _section(self, row: int, title: str, description: str = "") -> ctk.CTkFrame:
         frame = ctk.CTkFrame(
@@ -107,18 +129,18 @@ class SettingsPage(BasePage):
         )
         frame.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
         frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             frame,
             text=title,
-            font=(theme.FONT, 14, "bold"),
+            font=theme.font("section", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(14, 2), sticky="ew")
         if description:
-            ctk.CTkLabel(
+            theme.Label(
                 frame,
                 text=description,
-                font=(theme.FONT, 9),
+                font=theme.font("secondary", "normal", theme.FONT),
                 text_color=theme.TEXT_MUTED,
                 justify="left",
                 anchor="w",
@@ -140,14 +162,14 @@ class SettingsPage(BasePage):
         wrap.grid(row=row, column=0, padx=16, pady=5, sticky="ew")
         wrap.grid_columnconfigure(0, weight=1)
         text = ctk.CTkFrame(wrap, fg_color="transparent")
-        text.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(
-            text, text=name, font=(theme.FONT, 10, "bold"), text_color=theme.TEXT, anchor="w"
+        text.grid(row=0, column=0, columnspan=3, sticky="ew")
+        theme.Label(
+            text, text=name, font=theme.font("body", "bold", theme.FONT), text_color=theme.TEXT, anchor="w"
         ).pack(anchor="w")
-        ctk.CTkLabel(
+        theme.Label(
             text,
             text=description,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
             justify="left",
@@ -159,19 +181,19 @@ class SettingsPage(BasePage):
             theme.SUCCESS if state.get("running") else
             (theme.WARNING if state.get("available") else theme.TEXT_DIM)
         )
-        ctk.CTkLabel(
+        theme.Label(
             wrap,
             text=status,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             text_color=status_color,
             width=112,
             anchor="e",
-        ).grid(row=0, column=1, padx=(12, 10), sticky="e")
+        ).grid(row=1, column=0, padx=(0, 10), pady=(8, 4), sticky="w")
 
         available = bool(state.get("available"))
         running = bool(state.get("running"))
         busy = self._busy_service == service_key
-        button = ctk.CTkButton(
+        button = theme.Button(
             wrap,
             text="Applying…" if busy else ("Turn off" if running else "Turn on"),
             width=88,
@@ -184,7 +206,7 @@ class SettingsPage(BasePage):
             state="disabled" if (not available or busy) else "normal",
             command=lambda: self._set_service(service_key, not running),
         )
-        button.grid(row=0, column=2, sticky="e")
+        button.grid(row=1, column=2, pady=(8, 4), sticky="e")
 
     def _startup_row(self, parent: ctk.CTkFrame, row: int, state: dict) -> None:
         """Render the persistent Windows sign-in startup switch."""
@@ -193,21 +215,21 @@ class SettingsPage(BasePage):
         wrap.grid_columnconfigure(0, weight=1)
 
         text = ctk.CTkFrame(wrap, fg_color="transparent")
-        text.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(
+        text.grid(row=0, column=0, columnspan=3, sticky="ew")
+        theme.Label(
             text,
             text="Start AutoGuard with Windows",
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).pack(anchor="w")
-        ctk.CTkLabel(
+        theme.Label(
             text,
             text=state.get(
                 "detail",
                 "Starts AutoGuard in the system tray when you sign in to Windows.",
             ),
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             anchor="w",
             justify="left",
@@ -219,16 +241,16 @@ class SettingsPage(BasePage):
         busy = self._busy_service == "windows_startup"
         status = state.get("status", "Unavailable")
         status_color = theme.SUCCESS if enabled else (theme.TEXT_MUTED if available else theme.TEXT_DIM)
-        ctk.CTkLabel(
+        theme.Label(
             wrap,
             text=status,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             text_color=status_color,
             width=112,
             anchor="e",
-        ).grid(row=0, column=1, padx=(12, 10), sticky="e")
+        ).grid(row=1, column=0, padx=(0, 10), pady=(8, 4), sticky="w")
 
-        ctk.CTkButton(
+        theme.Button(
             wrap,
             text="Applying…" if busy else ("Turn off" if enabled else "Turn on"),
             width=88,
@@ -240,7 +262,7 @@ class SettingsPage(BasePage):
             text_color=theme.TEXT if available else theme.TEXT_DIM,
             state="disabled" if (not available or busy) else "normal",
             command=lambda: self._set_windows_startup(not enabled),
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=1, column=2, pady=(8, 4), sticky="e")
 
     def _info_row(
         self,
@@ -255,28 +277,28 @@ class SettingsPage(BasePage):
         wrap = ctk.CTkFrame(parent, fg_color="transparent")
         wrap.grid(row=row, column=0, padx=16, pady=5, sticky="ew")
         wrap.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            wrap, text=label, font=(theme.FONT, 10), text_color=theme.TEXT_MUTED, anchor="w"
+        theme.Label(
+            wrap, text=label, font=theme.font("body", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w"
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
+        theme.Label(
             wrap,
             text=value,
-            font=(theme.FONT_MONO if mono else theme.FONT, 9 if mono else 10),
+            font=theme.font("body", family=theme.FONT_MONO if mono else theme.FONT),
             text_color=theme.TEXT,
-            anchor="e",
-            justify="right",
+            anchor="w",
+            justify="left",
             wraplength=650,
-        ).grid(row=0, column=1, padx=(12, 0), sticky="e")
+        ).grid(row=1, column=0, columnspan=2, pady=(3, 0), sticky="ew")
         if detail:
-            ctk.CTkLabel(
+            theme.Label(
                 wrap,
                 text=detail,
-                font=(theme.FONT, 9),
+                font=theme.font("secondary", "normal", theme.FONT),
                 text_color=theme.TEXT_DIM,
                 anchor="w",
                 justify="left",
                 wraplength=820,
-            ).grid(row=1, column=0, columnspan=2, pady=(2, 0), sticky="ew")
+            ).grid(row=2, column=0, columnspan=2, pady=(4, 0), sticky="ew")
 
     def _protection_section(self, row: int) -> int:
         protection = self._data["protection"]
@@ -308,7 +330,7 @@ class SettingsPage(BasePage):
             startup["status"],
             detail=startup["detail"] + " This startup-only choice is not editable in the current in-app configuration layer.",
         )
-        ctk.CTkLabel(card, text="", height=6).grid(row=offset + 3, column=0)
+        theme.Label(card, text="", height=6).grid(row=offset + 3, column=0)
         return row + 1
 
     def _schedule_section(self, row: int) -> int:
@@ -335,7 +357,7 @@ class SettingsPage(BasePage):
             "Configured at launch",
             detail="AutoGuard does not currently expose a persisted in-app reschedule API, so Phase 11 does not create a fake frequency editor.",
         )
-        ctk.CTkLabel(card, text="", height=6).grid(row=6, column=0)
+        theme.Label(card, text="", height=6).grid(row=6, column=0)
         return row + 1
 
     def _scan_preferences_section(self, row: int) -> int:
@@ -353,20 +375,20 @@ class SettingsPage(BasePage):
             f"{mib:g} MiB",
             detail="The current scanner limit is startup-configured in this build.",
         )
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text="Protected locations",
-            font=(theme.FONT, 10, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=3, column=0, padx=16, pady=(8, 3), sticky="ew")
         paths = prefs.get("monitor_paths", ())
         if paths:
             for index, path in enumerate(paths, start=4):
-                ctk.CTkLabel(
+                theme.Label(
                     card,
                     text=str(path),
-                    font=(theme.FONT_MONO, 9),
+                    font=theme.font("secondary", "normal", theme.FONT_MONO),
                     text_color=theme.TEXT_MUTED,
                     justify="left",
                     anchor="w",
@@ -374,18 +396,18 @@ class SettingsPage(BasePage):
                 ).grid(row=index, column=0, padx=16, pady=2, sticky="ew")
             end_row = 4 + len(paths)
         else:
-            ctk.CTkLabel(
+            theme.Label(
                 card,
                 text="No protected locations are available for this launch.",
-                font=(theme.FONT, 9),
+                font=theme.font("secondary", "normal", theme.FONT),
                 text_color=theme.TEXT_DIM,
                 anchor="w",
             ).grid(row=4, column=0, padx=16, pady=2, sticky="ew")
             end_row = 5
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text="Custom exclusions are not exposed because AutoGuard does not currently have a user-configurable exclusion service.",
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             justify="left",
             anchor="w",
@@ -401,7 +423,7 @@ class SettingsPage(BasePage):
             "Only behavior already implemented by the existing quarantine service is shown.",
         )
         self._info_row(card, 2, "Retention", data["retention"], detail=data["detail"])
-        ctk.CTkLabel(card, text="", height=8).grid(row=3, column=0)
+        theme.Label(card, text="", height=8).grid(row=3, column=0)
         return row + 1
 
     def _application_section(self, row: int) -> int:
@@ -420,7 +442,7 @@ class SettingsPage(BasePage):
         self._startup_row(card, 4, data.get("windows_startup", {}))
         self._info_row(card, 5, "AutoGuard data", data["data_dir"], mono=True)
         self._info_row(card, 6, "Configuration", "Startup + runtime services", detail=data["configuration_note"])
-        ctk.CTkLabel(card, text="", height=8).grid(row=7, column=0)
+        theme.Label(card, text="", height=8).grid(row=7, column=0)
         return row + 1
 
     def _advanced_section(self, row: int) -> None:
@@ -429,7 +451,7 @@ class SettingsPage(BasePage):
             "Advanced",
             "Developer-oriented runtime paths and timing information are hidden by default.",
         )
-        ctk.CTkButton(
+        theme.Button(
             card,
             text="Hide advanced details" if self._advanced_open else "Show advanced details",
             width=154,
@@ -458,7 +480,7 @@ class SettingsPage(BasePage):
         self._path_group(card, detail_row, "Quick Scan targets", advanced.get("quick_paths", ()))
         detail_row += 1
         self._path_group(card, detail_row, "Full Scan targets", advanced.get("full_paths", ()))
-        ctk.CTkLabel(card, text="", height=8).grid(row=detail_row + 1, column=0)
+        theme.Label(card, text="", height=8).grid(row=detail_row + 1, column=0)
 
     def _path_group(self, parent: ctk.CTkFrame, row: int, label: str, paths) -> None:
         value = " • ".join(str(path) for path in paths) if paths else "None"
@@ -507,17 +529,17 @@ class SettingsPage(BasePage):
         )
         card.grid(row=row, column=0, padx=8, pady=(4, 8), sticky="ew")
         card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text=title,
-            font=(theme.FONT, 11, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             text_color=colors.get(tone, theme.TEXT),
             anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(11, 2), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             card,
             text=message,
-            font=(theme.FONT, 9),
+            font=theme.font("secondary", "normal", theme.FONT),
             text_color=theme.TEXT_MUTED,
             justify="left",
             anchor="w",

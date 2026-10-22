@@ -13,7 +13,7 @@ import customtkinter as ctk
 from app.ui import theme
 
 
-class StatusBadge(ctk.CTkLabel):
+class StatusBadge(theme.Label):
     """Small consistent status badge driven by an already user-facing key."""
 
     _ALIASES = {
@@ -35,7 +35,7 @@ class StatusBadge(ctk.CTkLabel):
         super().__init__(
             master,
             text=text,
-            font=(theme.FONT, 9, "bold"),
+            font=theme.font("secondary", "bold", theme.FONT),
             text_color=color,
             fg_color=background,
             corner_radius=6,
@@ -72,18 +72,18 @@ class StateCard(ctk.CTkFrame):
             **kwargs,
         )
         self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=title,
-            font=(theme.FONT, 14, "bold"),
+            font=theme.font("section", "bold", theme.FONT),
             text_color=color,
             anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(14, 3), sticky="ew")
         if message:
-            ctk.CTkLabel(
+            theme.Label(
                 self,
                 text=message,
-                font=(theme.FONT, 10),
+                font=theme.font("body", "normal", theme.FONT),
                 text_color=theme.TEXT_MUTED if tone not in {"danger", "error"} else theme.TEXT,
                 justify="left",
                 anchor="w",
@@ -97,10 +97,10 @@ class SectionHeader(ctk.CTkFrame):
     def __init__(self, master, title: str, *, count: int | None = None, **kwargs):
         super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
         self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
+        theme.Label(
             self,
             text=title,
-            font=(theme.FONT, 14, "bold"),
+            font=theme.font("section", "bold", theme.FONT),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
@@ -131,7 +131,7 @@ class ExpandableDetails(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self._title = title
         self._open = False
-        self.button = ctk.CTkButton(
+        self.button = theme.Button(
             self,
             text=f"{title}  ▾",
             height=38,
@@ -140,25 +140,25 @@ class ExpandableDetails(ctk.CTkFrame):
             text_color=theme.TEXT,
             anchor="w",
             border_width=0,
-            font=(theme.FONT, 11, "bold"),
+            font=theme.font("body", "bold", theme.FONT),
             command=self.toggle,
         )
         self.button.grid(row=0, column=0, padx=10, pady=6, sticky="ew")
         self.content = ctk.CTkFrame(self, fg_color="transparent")
         self.content.grid_columnconfigure(1, weight=1)
         for index, (label, value) in enumerate(rows):
-            ctk.CTkLabel(
+            theme.Label(
                 self.content,
                 text=label,
                 width=160,
-                font=(theme.FONT, 9, "bold"),
+                font=theme.font("secondary", "bold", theme.FONT),
                 text_color=theme.TEXT_MUTED,
                 anchor="nw",
             ).grid(row=index, column=0, padx=(10, 14), pady=5, sticky="nw")
-            ctk.CTkLabel(
+            theme.Label(
                 self.content,
                 text=str(value),
-                font=(theme.FONT_MONO if mono_values else theme.FONT, 9),
+                font=theme.font("secondary", family=theme.FONT_MONO if mono_values else theme.FONT),
                 text_color=theme.TEXT_DIM,
                 justify="left",
                 anchor="w",

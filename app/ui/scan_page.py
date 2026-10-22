@@ -47,18 +47,18 @@ class ScanPage(BasePage):
         self.idle_view = ctk.CTkFrame(self.body, fg_color="transparent", corner_radius=0)
         self.idle_view.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
+        theme.Label(
             self.idle_view,
             text="Scan your PC",
             text_color=theme.TEXT,
-            font=(theme.FONT, 22, "bold"),
+            font=theme.font("page", "bold", theme.FONT),
             anchor="w",
         ).grid(row=0, column=0, padx=8, pady=(4, 3), sticky="ew")
-        ctk.CTkLabel(
+        theme.Label(
             self.idle_view,
             text="Choose the scan that matches what you want to check.",
             text_color=theme.TEXT_MUTED,
-            font=(theme.FONT, 11),
+            font=theme.font("body", "normal", theme.FONT),
             anchor="w",
         ).grid(row=1, column=0, padx=8, pady=(0, 16), sticky="ew")
 
