@@ -52,7 +52,7 @@ if tuple(PAGE_CLASSES) != tuple(key for key, _ in NAV_ITEMS):
 # Central cross-page synchronization. These are presentation invalidations only;
 # they never construct/restart backend services. Hidden pages refresh on next show.
 STATE_CHANGE_TARGETS = {
-    "scan_started": {"home", "scan"},
+    "scan_started": {"home", "scan", "activity"},
     "scan_stopped": {"home", "scan", "activity"},
     "scan_completed": {"home", "scan", "threats", "quarantine", "activity"},
     "scan_batch_completed": {"home", "scan", "threats", "quarantine", "activity"},
@@ -62,6 +62,7 @@ STATE_CHANGE_TARGETS = {
     "threat_resolved": {"home", "threats", "activity"},
     "quarantine_verified": {"quarantine"},
     "quarantine_deleted": {"home", "threats", "quarantine", "activity"},
+    "quarantine_batch_deleted": {"home", "threats"},
     "recovery_completed": {"home", "threats", "quarantine", "activity"},
     "settings_applied": {"home", "settings"},
 }
@@ -70,6 +71,7 @@ GLOBAL_STATUS_EVENTS = {
     "scan_started", "scan_stopped", "scan_completed", "scan_batch_completed",
     "scan_result_ready", "incident_verified", "threat_resolved", "quarantine_deleted",
     "recovery_completed", "settings_applied",
+    "quarantine_batch_deleted",
 }
 PASSIVE_REFRESH_MS = 10000
 ACTIVE_SCAN_REFRESH_MS = 1000
@@ -180,6 +182,8 @@ class MainWindow(ctk.CTk):
         page = self.pages.get(name)
         if page is None:
             return
+        if self._active_page != name and self._active_page == "activity":
+            self.pages["activity"].on_hide()
         self._active_page = name
         self.sidebar.set_active(name)
         page.tkraise()
@@ -219,6 +223,10 @@ class MainWindow(ctk.CTk):
             # reach every page so hidden page state remains compatible.
             if message.kind in {"scan_discovered", "scan_result"}:
                 recipients = (self.pages["scan"],)
+                if message.kind == "scan_result":
+                    # A cheap invalidation only; Activity coordinates/throttles
+                    # its own bounded read and never rebuilds per-file here.
+                    self.pages["activity"].scan_data_changed(message.payload.get("session_id"))
             else:
                 recipients = tuple(self.pages.values())
             for page in recipients:
@@ -258,7 +266,7 @@ class MainWindow(ctk.CTk):
                     result.get("message", "The incident was closed."),
                     "verified",
                 )
-            elif message.kind == "quarantine_deleted":
+            elif message.kind in {"quarantine_deleted", "quarantine_batch_deleted"}:
                 result = message.payload.get("result", {})
                 self.notifications.show(
                     result.get("title", "Quarantine"),

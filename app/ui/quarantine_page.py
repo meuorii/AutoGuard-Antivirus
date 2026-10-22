@@ -1,22 +1,16 @@
-"""Simplified Quarantine experience for AutoGuard UX Refresh Phase 9."""
+"""Quarantine selection and confirmed, audited permanent deletion."""
 from __future__ import annotations
 
 import customtkinter as ctk
 
 from app.ui import theme
 from app.ui.base_page import BasePage
-from app.ui.components import ConfirmDialog, RestoreDialog, StateCard, StatusBadge
+from app.ui.components import ConfirmDialog, StateCard, StatusBadge
 from app.ui.quarantine_details_page import QuarantineDetailsView
 
 
-_STATUS_STYLE = {
-    "attention": (theme.WARNING, theme.WARNING_DARK),
-    "reviewing": (theme.WARNING, theme.WARNING_DARK),
-    "contained": (theme.SUCCESS, theme.SUCCESS_DARK),
-    "reappeared": (theme.WARNING, theme.WARNING_DARK),
-    "restored": (theme.INFO, theme.INFO_DARK),
-    "resolved": (theme.TEXT_MUTED, theme.SURFACE_ALT),
-}
+PAGE_SIZE = 50
+LOAD_TIMEOUT_MS = 20000
 
 
 class QuarantinePage(BasePage):
@@ -25,235 +19,411 @@ class QuarantinePage(BasePage):
 
     def __init__(self, master, controller, **kwargs):
         super().__init__(master, controller, **kwargs)
-        self._detail_ref: str | None = None
-        self._detail_data: dict | None = None
-        self._list_data: dict | None = None
-        self._notice: dict | None = None
+        self._detail_ref = None
+        self._detail_data = self._list_data = None
+        self._notice = None
+        self._batch_results = []
         self._loading = False
+        self._force_render = False
+        self._reload_pending = False
+        self._watchdog = None
+        self._batch_busy = False
+        self._discard_read = False
+        self._confirmation = None
+        self._selected = set()
+        self._filter_text = ""
+        self._filter_value = ctk.StringVar(value="")
+        self._filter_entry = None
+        self._page = 0
+        self._selection_widgets = {}
+        self._controls = []
+        self._pager_buttons = None
+        self._selection_label = self._delete_selected_button = self._status_label = None
+        self._select_all_button = self._deselect_all_button = None
 
     def on_show(self):
-        if self.controller.selected_quarantine_ref:
-            self._detail_ref = self.controller.selected_quarantine_ref
-            self._loading = True
-            self._show_loading("Loading file details…")
-            self.controller.load_quarantine_details(self._detail_ref)
-        else:
-            self._detail_ref = None
-            self._loading = True
+        selected = self.controller.selected_quarantine_ref
+        if selected != self._detail_ref:
+            self._loading = False
+            self._force_render = True
+        self._detail_ref = selected
+        if self._batch_busy:
+            return
+        if not self._list_data and not self._detail_data:
             self._show_loading("Loading quarantine…")
-            self.controller.load_quarantine()
-
-    def refresh_from_state(self, reason: str = "") -> None:
         self._refresh_current()
+
+    def refresh_from_state(self, reason=""):
+        self._refresh_current()
+
+    def _cancel_watchdog(self):
+        if self._watchdog is not None:
+            self.after_cancel(self._watchdog)
+            self._watchdog = None
+
+    def destroy(self):
+        self._cancel_watchdog()
+        self._detach_filter_entry()
+        super().destroy()
+
+    def _detach_filter_entry(self):
+        if self._filter_entry is not None:
+            # CTkEntry 5.2 does not remove its StringVar write trace when
+            # detached or destroyed. Remove that residual callback explicitly.
+            callback = getattr(self._filter_entry, "_textvariable_callback_name", None)
+            if callback and any(name == callback for mode, name in self._filter_value.trace_info()):
+                self._filter_value.trace_remove("write", callback)
+            self._filter_entry = None
+
+    def clear_body(self):
+        self._detach_filter_entry()
+        self._selection_widgets = {}
+        self._controls = []
+        self._pager_buttons = None
+        self._selection_label = self._delete_selected_button = self._status_label = None
+        self._select_all_button = self._deselect_all_button = None
+        super().clear_body()
+
+    def _refresh_current(self):
+        if self._batch_busy or self._loading:
+            self._reload_pending = True
+            return
+        self._loading = True
+        self._reload_pending = False
+        accepted = (self.controller.load_quarantine_details(self._detail_ref) if self._detail_ref
+                    else self.controller.load_quarantine())
+        if accepted is False:
+            self._loading = False
+            self._reload_pending = True
+        self._cancel_watchdog()
+        self._watchdog = self.after(LOAD_TIMEOUT_MS, self._load_timeout)
+
+    def _load_timeout(self):
+        self._watchdog = None
+        if self._loading or self._reload_pending:
+            self._loading = self._reload_pending = False
+            self._render_error("Loading took too long. Please retry.")
 
     def handle_message(self, message):
         kind = message.kind
         if kind == "quarantine_data" and self._detail_ref is None:
-            result = dict(message.payload.get("result", {}))
-            was_loading = self._loading
+            self._cancel_watchdog()
             self._loading = False
-            if was_loading or result != self._list_data:
+            if self._batch_busy or self._discard_read:
+                self._discard_read = False
+                self._reload_pending = True
+                return
+            result = dict(message.payload.get("result", {}))
+            if self._force_render or result != self._list_data:
                 self._list_data = result
                 self._render_list(result)
         elif kind == "quarantine_details_requested":
             self._detail_ref = message.payload.get("item_ref")
             self._detail_data = None
-            self._loading = True
+            self._loading = False
             self._show_loading("Loading file details…")
-            self.controller.load_quarantine_details(self._detail_ref)
+            self._refresh_current()
         elif kind == "quarantine_details_data":
             result = message.payload.get("result", {})
             if self._detail_ref and result.get("item_ref") == self._detail_ref:
-                was_loading = self._loading
+                self._cancel_watchdog()
                 self._loading = False
-                if was_loading or result != self._detail_data:
+                if self._batch_busy or self._discard_read:
+                    self._discard_read = False
+                    self._reload_pending = True
+                    return
+                if not self._batch_busy and (self._force_render or result != self._detail_data):
                     self._detail_data = result
                     self._render_details(result)
         elif kind == "quarantine_details_closed":
+            self._force_render = True
             self._detail_ref = None
             self._detail_data = None
-            self._loading = True
-            self._show_loading("Loading quarantine…")
-            self.controller.load_quarantine()
+            self._loading = False
+            self._refresh_current()
         elif kind == "quarantine_verified":
+            self._force_render = True
             result = message.payload.get("result", {})
-            self._notice = {
-                "title": result.get("title", "Integrity check finished"),
-                "message": result.get("message", "The integrity check finished."),
-                "tone": "success" if result.get("verified") else "error",
-            }
+            self._notice = {"title": result.get("title", "Integrity check finished"),
+                            "message": result.get("message", "The integrity check finished."),
+                            "tone": "success" if result.get("verified") else "error"}
             self._refresh_current()
-        elif kind == "recovery_completed":
+        elif kind == "quarantine_batch_deleted":
+            self._force_render = True
             result = message.payload.get("result", {})
-            self._notice = {
-                "title": result.get("title", "Restore finished"),
-                "message": result.get("message", "The restore operation finished."),
-                "tone": result.get("tone", "info"),
-            }
-            self._refresh_current()
-        elif kind == "quarantine_deleted":
-            result = message.payload.get("result", {})
-            self._notice = {
-                "title": result.get("title", "Removed from quarantine"),
-                "message": result.get("message", "The isolated file was removed."),
-                "tone": "warning",
-            }
-            if self._detail_ref == result.get("item_ref"):
-                self._detail_ref = None
-                self._detail_data = None
+            self._batch_busy = False
+            self._batch_results = list(result.get("items", ()))
+            succeeded = {item["item_ref"] for item in self._batch_results if item.get("deleted")}
+            self._selected.difference_update(succeeded)
+            self._notice = {"title": result.get("title", "Deletion finished"),
+                            "message": result.get("message", "Review the per-file deletion results below."),
+                            "tone": result.get("tone", "warning")}
+            if self._detail_ref in succeeded:
                 self.controller.close_quarantine_details()
             else:
-                self.controller.load_quarantine()
-        elif kind == "task_started":
-            task = str(message.payload.get("task", ""))
-            if task.startswith("verify-quarantine:"):
-                self._notice = {"title": "Verifying integrity", "message": "AutoGuard is checking the isolated file…", "tone": "info"}
-                if self._detail_data:
-                    self._render_details(self._detail_data)
-            elif task.startswith("restore:"):
-                self._notice = {"title": "Restoring file", "message": "AutoGuard is verifying and re-evaluating the file before restoration…", "tone": "info"}
-                if self._detail_data:
-                    self._render_details(self._detail_data)
-            elif task.startswith("delete-quarantine:"):
-                self._notice = {"title": "Deleting file", "message": "AutoGuard is permanently removing the isolated file…", "tone": "info"}
-                if self._detail_data:
-                    self._render_details(self._detail_data)
+                self._refresh_current()
         elif kind == "task_failed":
             task = str(message.payload.get("task", ""))
-            if task.startswith(("load-quarantine", "verify-quarantine:", "restore:", "delete-quarantine:")):
-                self._notice = {
-                    "title": "Operation failed",
-                    "message": message.payload.get("error", "AutoGuard could not complete this operation."),
-                    "tone": "error",
-                }
-                if self._detail_data:
-                    self._render_details(self._detail_data)
-                elif self._detail_ref is None:
-                    self._render_error(self._notice["message"])
+            if task == "delete-quarantine-batch":
+                self._force_render = True
+                self._batch_busy = False
+                self._notice = {"title": "Operation failed", "message": message.payload.get("error", "Deletion failed. Please retry."), "tone": "error"}
+                self._refresh_current()
+            elif task.startswith(("load-quarantine", "verify-quarantine:")):
+                self._loading = False
+                self._cancel_watchdog()
+                if self._batch_busy or self._discard_read:
+                    self._discard_read = False
+                    self._reload_pending = True
+                    return
+                self._render_error(message.payload.get("error", "AutoGuard could not complete this operation."))
+        elif kind == "task_finished" and str(message.payload.get("task", "")).startswith("load-quarantine"):
+            if self._reload_pending and not self._loading and not self._batch_busy:
+                self._refresh_current()
 
-    def _refresh_current(self):
-        if self._detail_ref:
-            self.controller.load_quarantine_details(self._detail_ref)
-        else:
-            self.controller.load_quarantine()
-
-    def _show_loading(self, text: str):
+    def _show_loading(self, title):
+        self._force_render = True
         self.clear_body()
-        self.body.grid_columnconfigure(0, weight=1)
-        StateCard(self.body, text, "This may take a moment.").grid(
-            row=0, column=0, padx=8, pady=8, sticky="ew"
-        )
+        StateCard(self.body, title, "Reading stored quarantine metadata.").grid(row=0, column=0, padx=8, pady=8, sticky="ew")
 
-    def _render_error(self, message: str):
+    def _render_error(self, message):
+        self._force_render = True
         self.clear_body()
-        self.body.grid_columnconfigure(0, weight=1)
-        StateCard(self.body, "Could not load quarantine", message, tone="danger").grid(
-            row=0, column=0, padx=8, pady=8, sticky="ew"
-        )
+        StateCard(self.body, "Operation failed", message, tone="danger").grid(row=0, column=0, padx=8, pady=8, sticky="ew")
+        self._button(self.body, "Retry", self._refresh_current).grid(row=1, column=0, padx=8, pady=8, sticky="w")
 
-    def _notice_widget(self, parent, row: int):
-        if not self._notice:
-            return row
-        tone = self._notice.get("tone", "info")
-        style = {
-            "success": (theme.SUCCESS, theme.SUCCESS_DARK),
-            "warning": (theme.WARNING, theme.WARNING_DARK),
-            "error": (theme.DANGER, theme.DANGER_DARK),
-            "info": (theme.INFO, theme.INFO_DARK),
-        }
-        color, background = style.get(tone, style["info"])
-        box = ctk.CTkFrame(parent, fg_color=background, border_width=1, border_color=color, corner_radius=theme.RADIUS_SMALL)
-        box.grid(row=row, column=0, padx=8, pady=(2, 10), sticky="ew")
-        box.grid_columnconfigure(0, weight=1)
-        theme.Label(box, text=self._notice.get("title", "Update"), font=theme.font("body", "bold", theme.FONT), text_color=color, anchor="w").grid(row=0, column=0, padx=14, pady=(10, 2), sticky="ew")
-        theme.Label(box, text=self._notice.get("message", ""), font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT, anchor="w", justify="left", wraplength=800).grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
-        return row + 1
+    def _button(self, parent, text, command, **kwargs):
+        return theme.Button(parent, text=text, command=command, fg_color=theme.SURFACE_ALT,
+                            hover_color=theme.SURFACE_HOVER, text_color=theme.TEXT, **kwargs)
 
-    def _render_list(self, data: dict):
-        self.clear_body()
-        self.body.grid_columnconfigure(0, weight=1)
-        row = self._notice_widget(self.body, 0)
-        count = int(data.get("isolated_count", 0))
-        summary = ctk.CTkFrame(self.body, fg_color="transparent")
-        summary.grid(row=row, column=0, padx=8, pady=(2, 12), sticky="ew")
-        summary.grid_columnconfigure(0, weight=1)
-        theme.Label(
-            summary,
-            text=f"{count:,} {'file' if count == 1 else 'files'} safely isolated",
-            font=theme.font("section", "bold", theme.FONT),
-            text_color=theme.TEXT,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w")
-        theme.Label(
-            summary,
-            text="Isolated files are kept separate from their original locations until you restore or delete them.",
-            font=theme.font("body", "normal", theme.FONT),
-            text_color=theme.TEXT_MUTED,
-            anchor="w",
-            justify="left",
-            wraplength=820,
-        ).grid(row=1, column=0, pady=(3, 0), sticky="ew")
-        row += 1
-
-        items = tuple(data.get("items", ()))
-        if not items:
-            empty = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
-            empty.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
-            theme.Label(empty, text="No files are currently isolated", font=theme.font("card", "bold", theme.FONT), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=18, pady=(18, 4), sticky="w")
-            theme.Label(empty, text="Quarantine will show files here when AutoGuard successfully isolates them.", font=theme.font("body", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=18, pady=(0, 18), sticky="w")
-            return
-
-        for item in items:
-            card = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS)
-            card.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
-            card.grid_columnconfigure(0, weight=1)
-            theme.Label(card, text=item.get("name", "Isolated file"), font=theme.font("card", "bold", theme.FONT), text_color=theme.TEXT, anchor="w").grid(row=0, column=0, padx=16, pady=(14, 2), sticky="ew")
-            theme.Label(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT_MUTED, anchor="w").grid(row=1, column=0, padx=16, sticky="ew")
-            theme.Label(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=theme.font("secondary", "normal", theme.FONT), text_color=theme.TEXT_DIM, anchor="w", justify="left", wraplength=650).grid(row=2, column=0, padx=16, pady=(2, 12), sticky="ew")
-
-            StatusBadge(
-                card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")
-            ).grid(row=3, column=0, padx=16, pady=(0, 8), sticky="w")
-            actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.grid(row=4, column=0, padx=13, pady=(4, 12), sticky="w")
-            ref = item.get("item_ref")
-            theme.Button(actions, text="View", width=70, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref: self.controller.open_quarantine_details(q)).pack(side="left", padx=3)
-            theme.Button(actions, text="Restore", width=76, height=28, fg_color=theme.SURFACE_ALT, hover_color=theme.SURFACE_HOVER, command=lambda q=ref, path=item.get("original_location", ""): self._restore(q, path)).pack(side="left", padx=3)
-            theme.Button(actions, text="Delete", width=70, height=28, fg_color=theme.DANGER_DARK, hover_color=theme.DANGER, text_color=theme.DANGER, command=lambda q=ref, name=item.get("name", "this file"): self._delete(q, name)).pack(side="left", padx=3)
+    def _notice_widget(self, row):
+        if self._notice:
+            StateCard(self.body, self._notice["title"], self._notice["message"],
+                      tone=self._notice.get("tone", "info")).grid(row=row, column=0, padx=8, pady=8, sticky="ew")
             row += 1
+        if self._batch_results:
+            report = ctk.CTkFrame(self.body, fg_color=theme.SURFACE)
+            report.grid(row=row, column=0, padx=8, pady=8, sticky="ew")
+            report.grid_columnconfigure(0, weight=1)
+            theme.Label(report, text="Per-file deletion results", font=theme.font("card", "bold"), text_color=theme.TEXT,
+                        anchor="w").grid(row=0, column=0, padx=12, pady=(10, 4), sticky="ew")
+            box = ctk.CTkTextbox(report, height=170, font=theme.font("body"), wrap="word", fg_color=theme.SURFACE_ALT, text_color=theme.TEXT)
+            box.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="ew")
+            lines = [f"{'Deleted' if item.get('deleted') else item.get('status', 'Failed').title()}: {item.get('name', item['item_ref'])} [{item['item_ref']}]\n{item.get('message', '')}" for item in self._batch_results]
+            box.insert("1.0", "\n\n".join(lines))
+            box.configure(state="disabled")
+            row += 1
+        return row
 
-    def _render_details(self, data: dict):
+    def _filtered_items(self):
+        items = (self._list_data or {}).get("items", ())
+        query = self._filter_text.casefold()
+        return [item for item in items if not query or query in
+                " ".join(str(item.get(key, "")) for key in ("name", "original_location", "threat_status")).casefold()]
+
+    def _apply_filter(self):
+        if self._batch_busy:
+            return
+        self._filter_text = self._filter_value.get().strip()
+        self._selected.clear()
+        self._page = 0
+        self._render_list(self._list_data or {})
+
+    def _change_page(self, delta):
+        if self._batch_busy:
+            return
+        self._page = max(0, self._page + delta)
+        self._render_list(self._list_data or {})
+        self.body._parent_canvas.yview_moveto(0)
+
+    def _select_all(self):
+        if not self._batch_busy:
+            self._selected = {item["item_ref"] for item in self._filtered_items()}
+            self._update_selection()
+
+    def _deselect_all(self):
+        if not self._batch_busy:
+            self._selected.clear()
+            self._update_selection()
+
+    def _toggle_item(self, ref):
+        if self._batch_busy:
+            return
+        if ref in self._selected:
+            self._selected.remove(ref)
+        else:
+            self._selected.add(ref)
+        self._update_selection()
+
+    def _update_selection(self):
+        for ref, (variable, checkbox, card) in self._selection_widgets.items():
+            selected = ref in self._selected
+            variable.set(selected)
+            checkbox.configure(state="disabled" if self._batch_busy else "normal")
+            card.configure(fg_color=theme.ACCENT_DARK if selected else theme.SURFACE,
+                           border_width=2 if selected else 1, border_color=theme.ACCENT if selected else theme.BORDER)
+        for control in self._controls:
+            control.configure(state="disabled" if self._batch_busy else "normal")
+        if self._pager_buttons is not None:
+            previous, next_button = self._pager_buttons
+            previous.configure(state="normal" if self._page and not self._batch_busy else "disabled")
+            next_button.configure(state="normal" if (self._page + 1) * PAGE_SIZE < len(self._filtered_items()) and not self._batch_busy else "disabled")
+        if self._selection_label:
+            count = len(self._selected)
+            self._select_all_button.configure(state="normal" if self._filtered_items() and not self._batch_busy else "disabled")
+            self._deselect_all_button.configure(state="normal" if count and not self._batch_busy else "disabled")
+            self._selection_label.configure(text=f"{count} {'file' if count == 1 else 'files'} selected")
+            self._delete_selected_button.configure(text=f"Delete Selected ({count})",
+                                                   state="normal" if count and not self._batch_busy else "disabled")
+            self._status_label.configure(text="Deleting selected files… Please wait for the batch results." if self._batch_busy else "")
+
+    def _render_list(self, data):
+        self._force_render = False
+        self._list_data = data
+        items = self._filtered_items()
+        self._selected.intersection_update(item["item_ref"] for item in items)
+        self._page = min(self._page, max(0, (len(items) - 1) // PAGE_SIZE))
+        position = self.body._parent_canvas.yview()[0]
         self.clear_body()
-        self.body.grid_columnconfigure(0, weight=1)
-        row = self._notice_widget(self.body, 0)
+        self._selection_widgets = {}
+        self._controls = []
+        self._pager_buttons = None
+        row = self._notice_widget(0)
+        toolbar = ctk.CTkFrame(self.body, fg_color="transparent", height=1)
+        toolbar.grid(row=row, column=0, padx=8, pady=8, sticky="ew")
+        toolbar.grid_columnconfigure(0, weight=1)
+        count = int(data.get("isolated_count", len(items)))
+        theme.Label(toolbar, text=f"{count:,} files safely isolated", font=theme.font("section", "bold"),
+                    text_color=theme.TEXT, anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        theme.Label(toolbar, text="Files remain isolated until permanently deleted. Security history is retained.",
+                    text_color=theme.TEXT_MUTED, anchor="w", justify="left").grid(row=1, column=0, sticky="ew", pady=4)
+        search = ctk.CTkFrame(toolbar, fg_color="transparent", height=1)
+        search.grid(row=2, column=0, sticky="ew", pady=6)
+        search.grid_columnconfigure(0, weight=1)
+        entry = ctk.CTkEntry(search, textvariable=self._filter_value, placeholder_text="Filter by filename, original path, or threat status",
+                              font=theme.font(), height=44)
+        self._filter_entry = entry
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        entry.bind("<Return>", lambda event: self._apply_filter())
+        apply = self._button(search, "Apply filter", self._apply_filter, width=130)
+        apply.grid(row=0, column=1, sticky="e")
+        theme.Label(toolbar, text=f"Select All selects all {len(items):,} matching files across every page. Applying a filter clears selection.",
+                    font=theme.font("secondary"), text_color=theme.TEXT_MUTED, anchor="w", justify="left").grid(row=3, column=0, sticky="ew", pady=5)
+        selections = ctk.CTkFrame(toolbar, fg_color="transparent", height=1)
+        selections.grid(row=4, column=0, sticky="ew", pady=6)
+        selections.grid_columnconfigure(2, weight=1)
+        select = self._button(selections, "Select All", self._select_all, width=110)
+        select.grid(row=0, column=0, padx=(0, 8), sticky="w")
+        deselect = self._button(selections, "Deselect All", self._deselect_all, width=120)
+        deselect.grid(row=0, column=1, sticky="w")
+        self._select_all_button, self._deselect_all_button = select, deselect
+        self._selection_label = theme.Label(selections, text="", text_color=theme.TEXT, anchor="w")
+        self._selection_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        self._delete_selected_button = theme.Button(selections, text="Delete Selected (0)", command=self._delete_selected,
+                                                    fg_color=theme.DANGER_DARK, hover_color=theme.DANGER,
+                                                    text_color=theme.DANGER)
+        self._delete_selected_button.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self._status_label = theme.Label(toolbar, text="", anchor="w", text_color=theme.WARNING)
+        self._status_label.grid(row=5, column=0, sticky="ew")
+        pager = ctk.CTkFrame(toolbar, fg_color="transparent", height=1)
+        pager.grid(row=6, column=0, sticky="ew", pady=6)
+        pager.grid_columnconfigure(1, weight=1)
+        previous = self._button(pager, "Previous", lambda: self._change_page(-1), width=110)
+        previous.grid(row=0, column=0, sticky="w")
+        theme.Label(pager, text=f"Page {self._page + 1} of {max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)} · {len(items):,} matching files",
+                    text_color=theme.TEXT_MUTED).grid(row=0, column=1, sticky="ew", padx=8)
+        next_button = self._button(pager, "Next", lambda: self._change_page(1), width=100)
+        next_button.grid(row=0, column=2, sticky="e")
+        self._controls.extend((entry, apply, select, deselect))
+        row += 1
+        visible = items[self._page * PAGE_SIZE:(self._page + 1) * PAGE_SIZE]
+        if not visible:
+            StateCard(self.body, "No matching files" if self._filter_text else "No files are currently isolated",
+                      "Try another filter." if self._filter_text else "Quarantine will show files here when AutoGuard isolates them.").grid(row=row, column=0, padx=8, pady=8, sticky="ew")
+        for item in visible:
+            ref = item["item_ref"]
+            card = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, corner_radius=theme.RADIUS, height=1)
+            card.grid(row=row, column=0, padx=8, pady=6, sticky="ew")
+            card.grid_columnconfigure(1, weight=1)
+            variable = ctk.BooleanVar(value=ref in self._selected)
+            checkbox = ctk.CTkCheckBox(card, text="", width=32, height=44, variable=variable, command=lambda value=ref: self._toggle_item(value),
+                                       fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, border_color=theme.TEXT_MUTED,
+                                       checkmark_color=theme.BG)
+            checkbox.grid(row=0, column=0, padx=(16, 8), pady=(10, 0), sticky="nw")
+            checkbox._canvas.configure(takefocus=1)
+            checkbox.bind("<space>", lambda event, widget=checkbox: widget.toggle())
+            checkbox.bind("<Return>", lambda event, widget=checkbox: widget.toggle())
+            checkbox.bind("<FocusIn>", lambda event, widget=checkbox: widget.configure(border_color=theme.TEXT))
+            checkbox.bind("<FocusOut>", lambda event, widget=checkbox: widget.configure(border_color=theme.TEXT_MUTED))
+            self._selection_widgets[ref] = (variable, checkbox, card)
+            theme.Label(card, text=item.get("name", "Isolated file"), font=theme.font("card", "bold"), text_color=theme.TEXT,
+                        anchor="w").grid(row=0, column=1, padx=(0, 16), pady=(10, 0), sticky="ew")
+            theme.Label(card, text=f"Contained {item.get('contained', 'time unavailable')}", font=theme.font("secondary"), text_color=theme.TEXT_MUTED,
+                        anchor="w").grid(row=1, column=0, columnspan=2, padx=16, pady=4, sticky="ew")
+            theme.Label(card, text=f"Original location: {item.get('original_location', 'Unavailable')}", font=theme.font("secondary"), text_color=theme.TEXT_DIM,
+                        anchor="w", justify="left").grid(row=2, column=0, columnspan=2, padx=16, pady=4, sticky="ew")
+            StatusBadge(card, item.get("threat_status", "Threat recorded"), item.get("threat_status_key", "idle")).grid(row=3, column=0, columnspan=2, padx=16, pady=4, sticky="w")
+            actions = ctk.CTkFrame(card, fg_color="transparent", height=1)
+            actions.grid(row=4, column=0, columnspan=2, padx=16, pady=(4, 12), sticky="w")
+            view = self._button(actions, text="View", command=lambda value=ref: self.controller.open_quarantine_details(value), width=90)
+            view.grid(row=0, column=0, padx=(0, 8))
+            delete = theme.Button(actions, text="Delete", command=lambda value=ref: self._confirm_delete((value,)), fg_color=theme.DANGER_DARK,
+                                  hover_color=theme.DANGER, text_color=theme.DANGER, width=90)
+            delete.grid(row=0, column=1)
+            self._controls.extend((view, delete))
+            row += 1
+        self._pager_buttons = (previous, next_button)
+        self._update_selection()
+        self.after_idle(lambda: self.body._parent_canvas.yview_moveto(position) if self._detail_ref is None else None)
+
+    def _render_details(self, data):
+        self._force_render = False
+        self.clear_body()
+        row = self._notice_widget(0)
         ref = data.get("item_ref")
-        details = QuarantineDetailsView(
-            self.body,
-            data,
-            on_back=self.controller.close_quarantine_details,
-            on_verify=lambda q=ref: self.controller.verify_quarantine(q),
-            on_restore=lambda q=ref, path=data.get("original_location", ""): self._restore(q, path),
-            on_delete=lambda q=ref, name=data.get("name", "this file"): self._delete(q, name),
-        )
-        details.grid(row=row, column=0, sticky="ew")
+        QuarantineDetailsView(self.body, dict(data, busy=self._batch_busy), on_back=self.controller.close_quarantine_details,
+                              on_verify=lambda: self.controller.verify_quarantine(ref),
+                              on_delete=lambda: self._confirm_delete((ref,))).grid(row=row, column=0, sticky="ew")
 
-    def _restore(self, item_ref: str, original_path: str):
-        RestoreDialog(
-            self,
-            original_path,
-            lambda destination: self.controller.restore_quarantine(item_ref, destination),
+    def _delete_selected(self):
+        if self._selected:
+            self._confirm_delete(tuple(sorted(self._selected)))
+
+    def _confirm_delete(self, refs):
+        if self._batch_busy or not refs:
+            return
+        if self._confirmation is not None and self._confirmation.winfo_exists():
+            self._confirmation.lift()
+            return
+        snapshot = tuple(refs)
+        self._confirmation = ConfirmDialog(
+            self, "Permanently Delete Quarantined Files?",
+            f"You are about to permanently delete {len(snapshot)} quarantined {'file' if len(snapshot) == 1 else 'files'}. "
+            "This action cannot be undone. The files will be removed from quarantine storage.\n\n"
+            "Original file locations are not deleted. Incident and security history will be retained.",
+            confirm_text="Delete Permanently", danger=True,
+            on_confirm=lambda: self._start_delete(snapshot),
         )
 
-    def _delete(self, item_ref: str, name: str):
-        ConfirmDialog(
-            self,
-            "Permanently delete isolated file",
-            (
-                f"Delete {name} from AutoGuard quarantine?\n\n"
-                "This permanently removes the isolated file. Audit history is retained, "
-                "but the file can no longer be restored from quarantine."
-            ),
-            confirm_text="Delete permanently",
-            danger=True,
-            on_confirm=lambda: self.controller.delete_quarantine(item_ref),
-        )
+    def _start_delete(self, refs):
+        self._confirmation = None
+        if self._batch_busy:
+            return
+        self._batch_busy = True
+        self._discard_read = self._loading
+        self._cancel_watchdog()
+        if self._detail_ref and self._detail_data:
+            self._render_details(self._detail_data)
+        elif self._selection_label is not None:
+            self._update_selection()
+        try:
+            accepted = self.controller.delete_quarantine_many(refs)
+            if not accepted:
+                raise RuntimeError("Another quarantine deletion is already running.")
+        except Exception as error:
+            self._batch_busy = False
+            self._notice = {"title": "Operation failed", "message": str(error), "tone": "error"}
+            if self._detail_ref and self._detail_data:
+                self._render_details(self._detail_data)
+            elif self._list_data:
+                self._render_list(self._list_data)

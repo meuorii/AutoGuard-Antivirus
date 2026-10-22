@@ -47,10 +47,14 @@ class AutoGuardUIController:
         self._ui_scan_status: dict[str, Any] | None = None
         self._selected_threat_ref: str | None = None
         self._selected_quarantine_ref: str | None = None
+        self._activity_pending = None
+        self._activity_reader_running = False
+        self._quarantine_delete_busy = False
 
     def shutdown(self) -> None:
         # Request cooperative interruption of a UI-launched scan before the
         # executor is released. Scanner persistence remains authoritative.
+        self.cancel_activity_view()
         self.stop_scan()
         self._executor.shutdown(wait=False, cancel_futures=False)
 
@@ -291,6 +295,12 @@ class AutoGuardUIController:
                 1 for item in quarantine if item.state.value == "QUARANTINED"
             ),
             "recent_activity": recent_activity,
+            # Reuse the already-read sessions to notify Activity of background
+            # file/USB scans without adding another periodic database reader.
+            "scan_history_revision": tuple(
+                (session.id, session.status.value, session.finished_at,
+                 tuple(sorted(session.counters.items()))) for session in recent
+            ),
         }
 
     @staticmethod
@@ -310,12 +320,17 @@ class AutoGuardUIController:
                 break
             if session.scan_type in (ScanType.MATCHING_COPY, ScanType.RECOVERY):
                 continue
-            details = self.services.scanner.history.get_scan(session.id)
             detection = None
-            if details is not None:
+            history = self.services.scanner.history
+            lookup = getattr(history, "latest_session_detection", None)
+            if callable(lookup):
+                detection = lookup(session.id)
+            else:
+                # Compatibility for older read-model providers/test doubles.
+                details = history.get_scan(session.id)
                 detection = next(
                     (
-                        result for result in reversed(details.results)
+                        result for result in reversed(details.results if details else ())
                         if result.detection_status in (
                             DetectionStatus.HIGH_CONFIDENCE,
                             DetectionStatus.LOW_CONFIDENCE,
@@ -1225,8 +1240,8 @@ class AutoGuardUIController:
             return f"{int(size):,} B"
         return f"{size:.1f} {unit}"
 
-    def load_quarantine(self) -> None:
-        self._submit_once("load-quarantine", self._quarantine_snapshot, "quarantine_data")
+    def load_quarantine(self) -> bool:
+        return self._submit_once("load-quarantine", self._quarantine_snapshot, "quarantine_data")
 
     def _quarantine_snapshot(self) -> dict[str, Any]:
         """Return only user-facing list data for currently isolated files."""
@@ -1275,11 +1290,11 @@ class AutoGuardUIController:
         self._selected_quarantine_ref = None
         self.bus.publish("quarantine_details_closed")
 
-    def load_quarantine_details(self, item_ref: str | None = None) -> None:
+    def load_quarantine_details(self, item_ref: str | None = None) -> bool:
         ref = str(item_ref or self._selected_quarantine_ref or "").strip()
         if not ref:
-            return
-        self._submit_once(
+            return False
+        return self._submit_once(
             f"load-quarantine-details:{ref}",
             lambda: self._quarantine_details_snapshot(ref),
             "quarantine_details_data",
@@ -1340,11 +1355,52 @@ class AutoGuardUIController:
             "original_size": self._friendly_size(item.original_size),
             "original_removed": "Yes" if item.original_removed else "No",
             "latest_recovery": latest_recovery,
-            "can_restore": item.state is QuarantineState.QUARANTINED,
             "can_delete": item.state is QuarantineState.QUARANTINED,
+            "can_verify": item.state is QuarantineState.QUARANTINED,
         }
 
     # ---------- Unified Activity read model ----------
+    def request_activity_view(self, request_id: int, *, session_id=None, page=0, filters=None) -> None:
+        """One reader with a latest-request slot; no overlapping Activity queries.
+
+        Workers publish only plain data. The Tk page validates the request token
+        before rendering, including failures from a previously selected session.
+        """
+        with self._lock:
+            self._activity_pending = (request_id, session_id, page, dict(filters or {}))
+            if self._activity_reader_running:
+                return
+            self._activity_reader_running = True
+
+        def read_latest():
+            while True:
+                with self._lock:
+                    request = self._activity_pending
+                    self._activity_pending = None
+                    if request is None:
+                        self._activity_reader_running = False
+                        return
+                token, selected, number, selected_filters = request
+                try:
+                    history = self.services.scanner.history
+                    result = (history.result_page(selected, page=number) if selected else
+                              history.session_page(page=number, **selected_filters))
+                    self.bus.publish("activity_view_data", request_id=token, result=result)
+                except Exception as error:
+                    self.bus.publish("activity_view_error", request_id=token,
+                                     error=f"{type(error).__name__}: {error}")
+        try:
+            self._executor.submit(read_latest)
+        except Exception:
+            with self._lock:
+                self._activity_reader_running = False
+            raise
+
+    def cancel_activity_view(self) -> None:
+        """Invalidate queued reads; an already-running snapshot may finish safely."""
+        with self._lock:
+            self._activity_pending = None
+
     _ACTIVITY_SCAN_LIMIT = 60
     _ACTIVITY_INCIDENT_LIMIT = 120
     _ACTIVITY_OUTPUT_LIMIT = 350
@@ -1809,6 +1865,7 @@ class AutoGuardUIController:
         if result is not None:
             state["result_emitted"] = True
             payload.update(
+                session_id=result.session_id,
                 status=result.status.value,
                 detection=result.detection.status.value if result.detection else None,
                 reason=result.reason,
@@ -1957,35 +2014,40 @@ class AutoGuardUIController:
             ),
         }.get(status, ("Restore finished", "The restore operation finished.", "info"))
 
-    def restore_quarantine(self, quarantine_id: str, destination: str | Path | None = None) -> None:
-        def restore() -> dict[str, Any]:
-            result = self.services.recovery.restore(quarantine_id, destination)
-            title, default_message, tone = self._recovery_status_text(result.status)
-            message = result.warning or result.error or default_message
-            return {
-                "item_ref": quarantine_id,
-                "restored": bool(result.restored),
-                "title": title,
-                "message": message,
-                "tone": tone,
-                "restored_path": result.restored_path,
-            }
-        self._submit(f"restore:{quarantine_id}", restore, "recovery_completed")
+    def delete_quarantine(self, quarantine_id: str) -> bool:
+        return self.delete_quarantine_many((quarantine_id,))
 
-    def delete_quarantine(self, quarantine_id: str) -> None:
-        def delete() -> dict[str, Any]:
-            deleted = bool(self.services.quarantine.delete_quarantine_object(quarantine_id))
-            return {
-                "item_ref": quarantine_id,
-                "deleted": deleted,
-                "title": "Removed from quarantine",
-                "message": (
-                    "The isolated file was permanently deleted. Audit history was retained."
-                    if deleted
-                    else "The isolated file could not be deleted."
-                ),
-            }
-        self._submit(f"delete-quarantine:{quarantine_id}", delete, "quarantine_deleted")
+    def delete_quarantine_many(self, quarantine_ids) -> bool:
+        """Submit one confirmed batch; reject overlapping deletion requests."""
+        if isinstance(quarantine_ids, (str, bytes)):
+            raise ValueError("Provide a collection of quarantine IDs.")
+        ids = tuple(dict.fromkeys(quarantine_ids))
+        if not ids:
+            return False
+        with self._lock:
+            if self._quarantine_delete_busy:
+                return False
+            self._quarantine_delete_busy = True
+
+        def delete_batch():
+            try:
+                outcomes = self.services.quarantine.delete_quarantine_objects(ids)
+                successes = sum(bool(item["deleted"]) for item in outcomes)
+                failures = len(outcomes) - successes
+                return {"items": outcomes, "deleted_count": successes, "failed_count": failures,
+                        "title": "Quarantine deletion complete" if not failures else "Quarantine deletion finished with issues",
+                        "message": f"{successes} permanently deleted; {failures} unsuccessful. Security history was retained.",
+                        "tone": "success" if not failures else "warning"}
+            finally:
+                with self._lock:
+                    self._quarantine_delete_busy = False
+        try:
+            self._submit("delete-quarantine-batch", delete_batch, "quarantine_batch_deleted")
+        except Exception:
+            with self._lock:
+                self._quarantine_delete_busy = False
+            raise
+        return True
 
     def resolve_threat(self, threat_ref: str) -> None:
         """Let the user close an incident. History, events and quarantine records are kept."""
@@ -2118,8 +2180,8 @@ class AutoGuardUIController:
                 "user_exclusions_supported": False,
             },
             "quarantine": {
-                "retention": "Until restored or deleted",
-                "detail": "AutoGuard keeps isolated files until you explicitly restore or permanently delete them.",
+                "retention": "Until permanently deleted",
+                "detail": "AutoGuard keeps isolated files until you explicitly delete them. Security history is retained.",
             },
             "application": {
                 "logs_dir": str(self.services.config.logs_dir),

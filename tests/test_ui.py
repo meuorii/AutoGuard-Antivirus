@@ -1405,11 +1405,11 @@ def test_ux_refresh_phase9_main_quarantine_view_hides_storage_internals_and_has_
 
     for required in (
         "safely isolated", "Original location:", 'text="View"',
-        'text="Restore"', 'text="Delete"', "No files are currently isolated",
+        "Delete Selected", "Select All", "Deselect All", 'text="Delete"', "No files are currently isolated",
         "Loading quarantine", "Operation failed",
     ):
         assert required in page
-    for forbidden in (".agq", "stored_path", "sha256", "quarantine_id"):
+    for forbidden in (".agq", "stored_path", "sha256", 'text="Restore"', "RestoreDialog"):
         assert forbidden not in page
 
     assert 'text="Hash verification"' in detail
@@ -1420,17 +1420,16 @@ def test_ux_refresh_phase9_main_quarantine_view_hides_storage_internals_and_has_
     assert '"Associated incident ID"' in detail
 
 
-def test_ux_refresh_phase9_restore_delete_verify_delegate_to_existing_services_off_ui_thread():
+def test_phase03_delete_and_verify_use_existing_services_and_restore_ui_is_removed():
     root = Path(__file__).resolve().parents[1]
     controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
     page = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
 
     assert "self.services.quarantine.verify_integrity(quarantine_id)" in controller
-    assert "self.services.recovery.restore(quarantine_id, destination)" in controller
-    assert "self.services.quarantine.delete_quarantine_object(quarantine_id)" in controller
+    assert "self.services.recovery.restore(quarantine_id, destination)" not in controller
+    assert "self.services.quarantine.delete_quarantine_objects(ids)" in controller
     assert 'self._submit(f"verify-quarantine:{quarantine_id}"' in controller
-    assert 'self._submit(f"restore:{quarantine_id}"' in controller
-    assert 'self._submit(f"delete-quarantine:{quarantine_id}"' in controller
+    assert 'self._submit("delete-quarantine-batch"' in controller
     for forbidden in ("hashlib", "sha256(", "unlink(", "shutil.", "open("):
         assert forbidden not in page
 
@@ -1438,8 +1437,8 @@ def test_ux_refresh_phase9_restore_delete_verify_delegate_to_existing_services_o
 def test_ux_refresh_phase9_delete_confirmation_is_user_facing_and_does_not_mention_agq():
     root = Path(__file__).resolve().parents[1]
     page = (root / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
-    assert "Permanently delete isolated file" in page
-    assert "file can no longer be restored from quarantine" in page
+    assert "Permanently Delete Quarantined Files?" in page
+    assert "This action cannot be undone" in page
     assert ".agq" not in page
 
 
@@ -1656,28 +1655,27 @@ def test_ux_refresh_phase10_high_confidence_scan_does_not_duplicate_canonical_in
     assert [event["title"] for event in feed].count("Confirmed threat detected") == 1
 
 
-def test_ux_refresh_phase10_activity_page_has_required_filters_states_and_hides_raw_backend_terms():
+def test_phase02_activity_page_exposes_session_filters_and_honest_order_labels():
     root = Path(__file__).resolve().parents[1]
     page = (root / "app/ui/activity_page.py").read_text(encoding="utf-8")
     controller = (root / "app/ui/controller.py").read_text(encoding="utf-8")
 
-    assert '("All", "Scans", "Threats", "Protection")' in page
-    assert "Loading activity" in page
-    assert "No activity has been recorded yet" in page
-    assert "No recorded protection changes" in page
+    for label in ("All scan types", "All statuses", "All dates", "No scan history",
+                  "No matching scans", "No recorded file results", "Back to Activity",
+                  "Scan Order", "Record Order", "Unable to load scan results"):
+        assert label in page
     assert 'section = "Today"' in controller
     assert 'section = "Yesterday"' in controller
-    for raw in (
-        "scan_session_id", "incident_id", "sha256", "FIRST_OBSERVED",
-        "LOW_CONFIDENCE", "HIGH_CONFIDENCE", "worker",
-    ):
+    for raw in ("incident_id", "sha256", "FIRST_OBSERVED"):
         assert raw not in page
 
 
-def test_ux_refresh_phase10_activity_loading_runs_off_ui_thread_and_uses_existing_services():
+def test_phase02_activity_loading_uses_existing_history_and_retains_legacy_event_readers():
     root = Path(__file__).resolve().parents[1]
     source = (root / "app/ui/controller.py").read_text(encoding="utf-8")
-    assert 'self._submit("load-activity", self._activity_snapshot, "activity_data")' in source
+    assert "self._executor.submit(read_latest)" in source
+    assert "history.result_page(selected, page=number)" in source
+    assert "history.session_page(page=number, **selected_filters)" in source
     assert "self.services.scanner.history" in source
     assert "self.services.incidents.list_incidents" in source
     assert "usb_monitor.recent_events()" in source
@@ -1813,7 +1811,7 @@ def test_ux_refresh_phase11_snapshot_reflects_real_service_and_config_state(tmp_
         assert snapshot["schedule"]["full_days"] == 7.0
         assert snapshot["scan_preferences"]["max_file_size_bytes"] == 512 * 1024 * 1024
         assert len(snapshot["scan_preferences"]["monitor_paths"]) == 3
-        assert snapshot["quarantine"]["retention"] == "Until restored or deleted"
+        assert snapshot["quarantine"]["retention"] == "Until permanently deleted"
         assert snapshot["application"]["logs_dir"].endswith("logs")
     finally:
         controller.shutdown()
@@ -1985,9 +1983,9 @@ def test_loading_state_hotfix_renders_empty_or_unchanged_threat_data():
 def test_loading_state_hotfix_applies_same_rule_to_quarantine_navigation():
     source = (Path(__file__).resolve().parents[1] / "app/ui/quarantine_page.py").read_text(encoding="utf-8")
     assert "self._loading = False" in source
-    assert "was_loading = self._loading" in source
-    assert "if was_loading or result != self._list_data:" in source
-    assert "if was_loading or result != self._detail_data:" in source
+    assert "self._force_render = True" in source
+    assert "if self._force_render or result != self._list_data:" in source
+    assert "self._force_render or result != self._detail_data" in source
 
 
 def test_windows_notification_milestone_surfaces_real_runtime_state_in_settings():

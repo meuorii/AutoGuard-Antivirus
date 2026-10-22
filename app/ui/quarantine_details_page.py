@@ -27,14 +27,13 @@ class QuarantineDetailsView(ctk.CTkFrame):
         *,
         on_back,
         on_verify,
-        on_restore,
         on_delete,
         **kwargs,
     ):
         super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
         self._data = data
         self.grid_columnconfigure(0, weight=1)
-        self._build(on_back, on_verify, on_restore, on_delete)
+        self._build(on_back, on_verify, on_delete)
 
     def _card(self, row: int) -> ctk.CTkFrame:
         card = ctk.CTkFrame(
@@ -48,7 +47,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
         card.grid_columnconfigure(0, weight=1)
         return card
 
-    def _build(self, on_back, on_verify, on_restore, on_delete) -> None:
+    def _build(self, on_back, on_verify, on_delete) -> None:
         theme.Button(
             self,
             text="← Back to Quarantine",
@@ -138,6 +137,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
             fg_color=theme.SURFACE_ALT,
             hover_color=theme.SURFACE_HOVER,
             command=on_verify,
+            state="normal" if self._data.get("can_verify", True) and not self._data.get("busy") else "disabled",
         ).grid(row=4, column=0, padx=18, pady=(4, 16), sticky="w")
 
         details = self._card(3)
@@ -169,7 +169,7 @@ class QuarantineDetailsView(ctk.CTkFrame):
             self._detail_row(
                 details,
                 final_row,
-                "Latest restore attempt",
+                "Historical recovery attempt",
                 f"{latest.get('status', 'Finished')} · {latest.get('when', 'Time unavailable')}",
             )
             final_row += 1
@@ -178,24 +178,13 @@ class QuarantineDetailsView(ctk.CTkFrame):
         actions.grid(row=final_row, column=0, padx=18, pady=(10, 16), sticky="ew")
         theme.Button(
             actions,
-            text="Restore",
-            width=90,
-            height=32,
-            fg_color=theme.ACCENT,
-            hover_color=theme.ACCENT_HOVER,
-            text_color="#07110F",
-            state="normal" if self._data.get("can_restore") else "disabled",
-            command=on_restore,
-        ).pack(side="left")
-        theme.Button(
-            actions,
             text="Delete",
             width=84,
             height=32,
             fg_color=theme.DANGER_DARK,
             hover_color=theme.DANGER,
             text_color=theme.DANGER,
-            state="normal" if self._data.get("can_delete") else "disabled",
+            state="normal" if self._data.get("can_delete") and not self._data.get("busy") else "disabled",
             command=on_delete,
         ).pack(side="left", padx=(8, 0))
 

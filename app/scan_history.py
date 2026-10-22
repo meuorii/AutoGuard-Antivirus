@@ -36,6 +36,7 @@ def _session(row: sqlite3.Row) -> ScanSession:
         finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
         status=ScanSessionStatus(row["status"]),
         counters={name: row[name] for name in COUNTER_NAMES}, error=row["error"],
+        result_order_version=row["result_order_version"],
     )
 
 
@@ -51,6 +52,7 @@ def _result(row: sqlite3.Row) -> StoredScanResult:
             SignatureKind(row["matched_signature_kind"]) if row["matched_signature_kind"] else None
         ),
         recorded_at=datetime.fromisoformat(row["recorded_at"]),
+        processing_order=row["processing_order"],
     )
 
 
@@ -77,8 +79,8 @@ class ScanHistory:
         source_path = str(normalize_path(source_path))
         with self.database.connection() as connection:
             connection.execute(
-                """INSERT INTO scan_sessions (id, scan_type, source_path, source, started_at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO scan_sessions (id, scan_type, source_path, source, started_at, result_order_version)
+                   VALUES (?, ?, ?, ?, ?, 1)""",
                 (session_id, scan_type.value, source_path, source.value, _utc_now()),
             )
             row = connection.execute(
@@ -112,13 +114,22 @@ class ScanHistory:
         def persist(connection: sqlite3.Connection) -> StoredScanResult:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                _running(connection, session_id)
+                session = _running(connection, session_id)
+                # The scanner calls this synchronously after each processed
+                # outcome. Allocate under the same write lock as the insert so
+                # concurrent sessions cannot influence one another's sequence.
+                sequence = None
+                if session["result_order_version"] == 1:
+                    sequence = connection.execute(
+                        "SELECT COALESCE(MAX(processing_order), 0) + 1 FROM scan_results WHERE session_id = ? AND processing_order IS NOT NULL",
+                        (session_id,),
+                    ).fetchone()[0]
                 cursor = connection.execute(
                 """INSERT INTO scan_results (
                     session_id, path, sha256, result_category, entry_kind,
                     detection_status, detection_confidence, rule_name, reason,
-                    detection_reason, matched_signature_name, matched_signature_kind, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    detection_reason, matched_signature_name, matched_signature_kind, recorded_at, processing_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, str(normalize_path(result.path)), sha256,
                     result.status.value, result.kind,
@@ -127,7 +138,7 @@ class ScanHistory:
                     detection.rule_name if detection else None, result.reason,
                     detection.reason if detection else None,
                     signature.name if signature else None,
-                    signature.kind.value if signature else None, _utc_now(),
+                    signature.kind.value if signature else None, _utc_now(), sequence,
                 ),
             )
                 # Column names come only from the shared model, never user input.
@@ -229,6 +240,93 @@ class ScanHistory:
                 (limit,),
             ).fetchall()
         return [_session(row) for row in rows]
+
+    @staticmethod
+    def _validate_page(page: int, page_size: int) -> None:
+        if type(page) is not int or page < 0:
+            raise ValueError("page must be a nonnegative integer")
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
+
+    @staticmethod
+    def _safe_count(connection, session_id):
+        return connection.execute(
+            """SELECT COUNT(*) FROM scan_results WHERE session_id = ?
+               AND result_category = 'SCANNED' AND detection_status = 'NO_DETECTION'""",
+            (session_id,),
+        ).fetchone()[0]
+
+    def session_page(self, *, page=0, page_size=50, start_at=None, end_at=None,
+                     scan_type=None, status=None) -> dict:
+        """Bounded, newest-first session query in one consistent snapshot.
+
+        Date bounds are inclusive/exclusive UTC ISO timestamps. Scheduled,
+        startup and USB filters also match the independently persisted source.
+        """
+        self._validate_page(page, page_size)
+        clauses, parameters = [], []
+        if start_at is not None:
+            clauses.append("started_at >= ?")
+            parameters.append(start_at)
+        if end_at is not None:
+            clauses.append("started_at < ?")
+            parameters.append(end_at)
+        if scan_type:
+            kind = ScanType(scan_type).value
+            if kind in {"scheduled", "startup", "usb"}:
+                clauses.append("(scan_type = ? OR source = ?)")
+                parameters.extend((kind, kind))
+            else:
+                clauses.append("scan_type = ?")
+                parameters.append(kind)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(ScanSessionStatus(status).value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.database.connection() as connection:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("BEGIN")
+            total = connection.execute("SELECT COUNT(*) FROM scan_sessions" + where, parameters).fetchone()[0]
+            rows = connection.execute(
+                "SELECT * FROM scan_sessions" + where + " ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                (*parameters, page_size, page * page_size),
+            ).fetchall()
+            items = [{"session": _session(row), "safe": self._safe_count(connection, row["id"])} for row in rows]
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+    def result_page(self, session_id: str, *, page=0, page_size=50) -> dict:
+        """Read only one session and at most 100 outcomes; never rerun detection."""
+        self._validate_page(page, page_size)
+        with self.database.connection() as connection:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("BEGIN")
+            row = connection.execute("SELECT * FROM scan_sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError("This scan session could not be found.")
+            session = _session(row)
+            total = connection.execute("SELECT COUNT(*) FROM scan_results WHERE session_id = ?", (session_id,)).fetchone()[0]
+            guaranteed = session.result_order_version == 1
+            order = "processing_order" if guaranteed else "id"
+            rows = connection.execute(
+                f"SELECT * FROM scan_results WHERE session_id = ? ORDER BY {order}, id LIMIT ? OFFSET ?",
+                (session_id, page_size, page * page_size),
+            ).fetchall()
+            safe = self._safe_count(connection, session_id)
+        return {"session": session, "safe": safe, "total": total, "page": page,
+                "page_size": page_size, "guaranteed_order": guaranteed,
+                "items": [{"result": _result(row),
+                           "order": row["processing_order"] if guaranteed else page * page_size + index + 1}
+                          for index, row in enumerate(rows)]}
+
+    def latest_session_detection(self, session_id: str) -> StoredScanResult | None:
+        """Bounded dashboard lookup; never materialize a session's entire file list."""
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM scan_results WHERE session_id = ?
+                   AND detection_status IN ('HIGH_CONFIDENCE', 'LOW_CONFIDENCE')
+                   ORDER BY id DESC LIMIT 1""", (session_id,),
+            ).fetchone()
+        return _result(row) if row else None
 
     def get_scan(self, session_id: str) -> ScanDetails | None:
         """Read the session and its ordered outcomes in one SQLite snapshot."""

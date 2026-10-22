@@ -1,10 +1,10 @@
 from __future__ import annotations
-import os, shutil, sqlite3
+import os, shutil, sqlite3, stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 from app.database import Database
 from app.hashing import normalize_path
 from app.incidents import IncidentEventType, IncidentService, IncidentStatus
@@ -14,6 +14,10 @@ from app.quarantine_integrity import IntegrityResult, verify_quarantine_file
 class QuarantineState(str, Enum): PENDING = "PENDING"; QUARANTINED = "QUARANTINED"; FAILED = "FAILED"
 class QuarantineIntegrityStatus(str, Enum): PENDING = "PENDING"; VERIFIED = "VERIFIED"; FAILED = "FAILED"
 
+
+class QuarantineDeletionNeedsReview(OSError):
+    """Storage disposal was requested but its final outcome is uncertain."""
+
 @dataclass(frozen=True)
 class QuarantineItem:
     quarantine_id: str; incident_id: str; original_path: str; stored_path: str; sha256: str
@@ -21,6 +25,7 @@ class QuarantineItem:
     original_source: ScanSource; state: QuarantineState; integrity_status: QuarantineIntegrityStatus
     verified_sha256: str | None; verified_size: int | None; verified_at: datetime | None
     original_removed: bool; failure_reason: str | None
+    deleted_at: datetime | None = None
 
 class QuarantineService:
     """Move verified threat content into non-executable internal storage."""
@@ -104,14 +109,132 @@ class QuarantineService:
         return Path(item.original_path).exists()
 
     def delete_quarantine_object(self, quarantine_id: str) -> bool:
-        item = self.get_item(quarantine_id)
-        if item is None: raise KeyError(f"Unknown quarantine item: {quarantine_id}")
-        try: Path(item.stored_path).unlink(missing_ok=True)
-        except OSError as error: raise OSError(f"Could not delete quarantine object {quarantine_id}: {error}") from error
-        with self.database.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("""UPDATE quarantine_items SET state = 'FAILED', integrity_status = 'FAILED', failure_reason = ? WHERE quarantine_id = ?""", ("Quarantine object permanently deleted by user.", quarantine_id))
+        """Compatibility entry point; all deletion uses the same guarded service."""
+        result = self.delete_quarantine_objects((quarantine_id,))[0]
+        if not result["deleted"]:
+            raise OSError(result["message"])
         return True
+
+    def delete_quarantine_objects(self, quarantine_ids, *, batch_id: str | None = None) -> list[dict]:
+        """Independently commit each selected outcome; never delete evidence rows.
+
+        A durable RUNNING attempt claims each object before touching storage.
+        Crashed/incomplete claims block retries rather than guessing an outcome.
+        """
+        if isinstance(quarantine_ids, (str, bytes)):
+            raise ValueError("Provide a collection of quarantine IDs.")
+        ids, seen = [], set()
+        for value in quarantine_ids:
+            if isinstance(value, str):
+                if value in seen:
+                    continue
+                seen.add(value)
+            ids.append(value)
+        if not ids:
+            return []
+        batch_id = batch_id or str(uuid4())
+        return [self._delete_selected_object(value, batch_id) for value in ids]
+
+    def _delete_selected_object(self, requested_id, batch_id):
+        attempt_id = str(uuid4())
+        requested_text = str(requested_id)
+        item = None
+        claimed = False
+        storage_deleted = False
+        outcome = {"item_ref": requested_text, "name": requested_text, "deleted": False,
+                   "status": "FAILED", "message": "Deletion did not complete."}
+        try:
+            if not isinstance(requested_id, str) or str(UUID(requested_id)) != requested_id:
+                raise ValueError("Invalid quarantine ID.")
+            with self.database.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute("SELECT * FROM quarantine_items WHERE quarantine_id = ?", (requested_id,)).fetchone()
+                if row is None:
+                    raise ValueError("The selected quarantine item does not exist.")
+                item = _item(row)
+                outcome["name"] = Path(item.original_path).name
+                if item.deleted_at or str(item.failure_reason or "").startswith("Quarantine object permanently deleted"):
+                    outcome["status"] = "ALREADY_DELETED"
+                    raise ValueError("This quarantine object was already permanently deleted.")
+                if item.state is QuarantineState.PENDING:
+                    raise ValueError("Quarantine is still in progress; this file cannot be deleted yet.")
+                if item.state is not QuarantineState.QUARANTINED:
+                    raise ValueError("This item is not in a completed quarantined state.")
+                running = connection.execute("SELECT 1 FROM quarantine_deletion_attempts WHERE quarantine_id=? AND status='RUNNING'", (requested_id,)).fetchone()
+                if running:
+                    raise ValueError("A deletion is already running or requires reconciliation for this item.")
+                connection.execute(
+                    """INSERT INTO quarantine_deletion_attempts
+                       (id, batch_id, requested_id, quarantine_id, incident_id, attempted_at, status, message)
+                       VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', 'Deletion requested by user.')""",
+                    (attempt_id, batch_id, requested_id, requested_id, item.incident_id, _utc_now()),
+                )
+            claimed = True
+            with self.database.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute("SELECT * FROM quarantine_items WHERE quarantine_id=?", (requested_id,)).fetchone()
+                if current is None or current["state"] != "QUARANTINED" or current["deleted_at"]:
+                    raise ValueError("The quarantine state changed; no file was deleted.")
+                item = _item(current)
+                target = self._deletion_target(item)
+                _unlink_quarantine_object(target)
+                storage_deleted = True
+                now = _utc_now()
+                # FAILED is the existing non-restorable terminal state. Keep
+                # the original hash, last verification, incident and recovery
+                # evidence; intentional disposal is not an integrity failure.
+                connection.execute(
+                    """UPDATE quarantine_items SET state='FAILED', deleted_at=?, failure_reason=?
+                       WHERE quarantine_id=?""",
+                    (now, "Quarantine object permanently deleted by user.", requested_id),
+                )
+                connection.execute("UPDATE quarantine_deletion_attempts SET status='DELETED', finished_at=?, message=? WHERE id=?",
+                                   (now, "Quarantine object permanently deleted. Security history retained.", attempt_id))
+            outcome.update(deleted=True, status="DELETED", message="Permanently deleted from quarantine storage.")
+        except Exception as error:
+            if isinstance(error, FileNotFoundError):
+                outcome["status"] = "MISSING"
+            elif isinstance(error, (ValueError, KeyError)) and outcome["status"] != "ALREADY_DELETED":
+                outcome["status"] = "REJECTED"
+            outcome["message"] = f"{type(error).__name__}: {error}"
+            needs_review = storage_deleted or isinstance(error, QuarantineDeletionNeedsReview)
+            if needs_review:
+                outcome["status"] = "RECONCILIATION_REQUIRED"
+                outcome["message"] = "Storage disposal occurred or is uncertain, but finalization failed. The item is blocked from repeated deletion pending reconciliation. " + outcome["message"]
+            try:
+                with self.database.connection() as connection:
+                    if claimed and needs_review:
+                        # Retain the durable exclusive claim when a crash or
+                        # database failure makes the two-resource outcome unclear.
+                        connection.execute("UPDATE quarantine_deletion_attempts SET message=? WHERE id=?", (outcome["message"], attempt_id))
+                    elif claimed:
+                        connection.execute("UPDATE quarantine_deletion_attempts SET status=?, finished_at=?, message=? WHERE id=?",
+                                           (outcome["status"], _utc_now(), outcome["message"], attempt_id))
+                    else:
+                        connection.execute(
+                            """INSERT INTO quarantine_deletion_attempts
+                               (id, batch_id, requested_id, quarantine_id, incident_id, attempted_at, finished_at, status, message)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (attempt_id, batch_id, requested_text, item.quarantine_id if item else None,
+                             item.incident_id if item else None, _utc_now(), _utc_now(), outcome["status"], outcome["message"]),
+                        )
+            except Exception as audit_error:
+                outcome["message"] += f" Audit update could not be saved: {audit_error}"
+        return outcome
+
+    def _deletion_target(self, item: QuarantineItem) -> Path:
+        root = self.quarantine_dir
+        if root.resolve() != root or root.is_symlink():
+            raise ValueError("Quarantine storage was redirected; deletion was refused.")
+        expected = root / f"{item.quarantine_id}.agq"
+        if os.path.normcase(os.path.abspath(item.stored_path)) != os.path.normcase(str(expected)):
+            raise ValueError("Stored path does not identify this quarantine object.")
+        if os.path.normcase(os.path.abspath(item.original_path)) == os.path.normcase(str(expected)):
+            raise ValueError("Quarantine object cannot be an original file path.")
+        info = expected.lstat()
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Quarantine object is not a regular file; links and redirected paths are refused.")
+        return expected
 
     def _existing_success(self, incident_id: str, original_path: str, sha256: str) -> QuarantineItem | None:
         with self.database.connection() as connection: row = connection.execute("""SELECT * FROM quarantine_items WHERE incident_id = ? AND original_path = ? AND sha256 = ? AND state = 'QUARANTINED' ORDER BY quarantined_at DESC, rowid DESC LIMIT 1""", (incident_id, original_path, sha256)).fetchone()
@@ -150,7 +273,7 @@ class QuarantineService:
         return any(Path(item.path).exists() for item in details.files)
 
 def _item(row: sqlite3.Row) -> QuarantineItem:
-    return QuarantineItem(quarantine_id=row["quarantine_id"], incident_id=row["incident_id"], original_path=row["original_path"], stored_path=row["stored_path"], sha256=row["sha256"], original_size=row["original_size"], created_at=datetime.fromisoformat(row["created_at"]), quarantined_at=datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None, reason=row["reason"], original_source=ScanSource(row["original_source"]), state=QuarantineState(row["state"]), integrity_status=QuarantineIntegrityStatus(row["integrity_status"]), verified_sha256=row["verified_sha256"], verified_size=row["verified_size"], verified_at=datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None, original_removed=bool(row["original_removed"]), failure_reason=row["failure_reason"])
+    return QuarantineItem(quarantine_id=row["quarantine_id"], incident_id=row["incident_id"], original_path=row["original_path"], stored_path=row["stored_path"], sha256=row["sha256"], original_size=row["original_size"], created_at=datetime.fromisoformat(row["created_at"]), quarantined_at=datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None, reason=row["reason"], original_source=ScanSource(row["original_source"]), state=QuarantineState(row["state"]), integrity_status=QuarantineIntegrityStatus(row["integrity_status"]), verified_sha256=row["verified_sha256"], verified_size=row["verified_size"], verified_at=datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None, original_removed=bool(row["original_removed"]), failure_reason=row["failure_reason"], deleted_at=datetime.fromisoformat(row["deleted_at"]) if row["deleted_at"] else None)
 
 def _sha256(value: str) -> str:
     normalized = value.strip().lower()
@@ -158,6 +281,72 @@ def _sha256(value: str) -> str:
     return normalized
 
 def _utc_now() -> str: return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _unlink_quarantine_object(target: Path) -> None:
+    """Delete one verified storage name, never a resolved link target.
+
+    Windows uses a non-shared DELETE handle and validates its final path and
+    attributes before disposal. This closes the rename/reparse gap between
+    inspecting a path and deleting it. No directories or original paths enter
+    this helper. Other platforms unlink relative to an opened directory.
+    """
+    if os.name != "nt":
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.stat(target.name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Storage object changed into a non-regular file.")
+            os.unlink(target.name, dir_fd=directory)
+        finally:
+            os.close(directory)
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel.GetFileInformationByHandleEx.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel.SetFileInformationByHandle.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(target), 0x00010000 | 0x80, 0, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    disposal_requested = False
+    try:
+        class Attributes(ctypes.Structure):
+            _fields_ = (("attributes", wintypes.DWORD), ("tag", wintypes.DWORD))
+        attributes = Attributes()
+        if not kernel.GetFileInformationByHandleEx(handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.attributes & (0x400 | 0x10):
+            raise ValueError("Storage object is a redirected path or directory.")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise OSError("Could not validate the final quarantine storage path.")
+        final = buffer.value
+        if final.startswith("\\\\?\\UNC\\"):
+            final = "\\\\" + final[8:]
+        elif final.startswith("\\\\?\\"):
+            final = final[4:]
+        if os.path.normcase(final) != os.path.normcase(str(target)):
+            raise ValueError("The storage path changed; no file was deleted.")
+        delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile (BOOLEAN)
+        if not kernel.SetFileInformationByHandle(handle, 4, ctypes.byref(delete), ctypes.sizeof(delete)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        disposal_requested = True
+    finally:
+        if not kernel.CloseHandle(handle):
+            if disposal_requested:
+                raise QuarantineDeletionNeedsReview("Windows accepted disposal but could not confirm closing the object handle.")
+            raise ctypes.WinError(ctypes.get_last_error())
 
 def _safe_unlink(path: Path) -> None:
     try: path.unlink(missing_ok=True)

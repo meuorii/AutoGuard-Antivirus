@@ -4,7 +4,7 @@ import customtkinter as ctk
 from app.ui import theme
 from app.ui.main_window import PAGE_CLASSES
 from app.ui.sidebar import Sidebar
-from app.ui.components.dialogs import ConfirmDialog, RestoreDialog
+from app.ui.components.dialogs import ConfirmDialog
 from app.ui.threat_details_page import ThreatDetailsView
 from app.ui.quarantine_details_page import QuarantineDetailsView
 
@@ -60,7 +60,7 @@ def main():
         for view_class, kwargs in (
             (ThreatDetailsView, {"on_back": lambda: None}),
             (QuarantineDetailsView, {"on_back": lambda: None, "on_verify": lambda: None,
-                                     "on_restore": lambda: None, "on_delete": lambda: None}),
+                                     "on_delete": lambda: None}),
         ):
             page = by_name["quarantine"]
             page.clear_body()
@@ -70,8 +70,7 @@ def main():
             root.update()
             view.destroy()
         print("Populated cards, settings, and detail views OK")
-        for dialog in (ConfirmDialog(root, "Delete file?", "Critical warning: this action permanently deletes the isolated file. " * 3),
-                       RestoreDialog(root, "C:/example/file.txt", lambda value: None)):
+        for dialog in (ConfirmDialog(root, "Delete file?", "Critical warning: this action permanently deletes the isolated file. " * 3),):
             root.update()
             dialog.destroy()
         # Exercise deferred wrapping in mainloop, including destruction before

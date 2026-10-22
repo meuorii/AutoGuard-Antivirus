@@ -102,11 +102,13 @@ class ScanSessionStatus(str, Enum):
 @dataclass(frozen=True)
 class ScanSession:
     id: str; scan_type: ScanType; source_path: str; source: ScanSource; started_at: datetime; finished_at: datetime | None; status: ScanSessionStatus; counters: dict[str, int]; error: str | None = None
+    result_order_version: int = 0
 
 @dataclass(frozen=True)
 class StoredScanResult:
     """Historical evidence snapshot; reading history never reruns detection."""
     id: int; session_id: str; path: str; sha256: str | None; result_category: ScanStatus; entry_kind: EntryKind; detection_status: DetectionStatus | None; detection_confidence: float | None; rule_name: str | None; reason: str; detection_reason: str | None; matched_signature_name: str | None; matched_signature_kind: SignatureKind | None; recorded_at: datetime
+    processing_order: int | None = None
 
 @dataclass(frozen=True)
 class ScanDetails:

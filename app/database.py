@@ -31,6 +31,17 @@ CREATE TABLE IF NOT EXISTS quarantine_recovery_attempts (id TEXT PRIMARY KEY NOT
 CREATE INDEX IF NOT EXISTS idx_recovery_attempts_quarantine ON quarantine_recovery_attempts(quarantine_id, attempted_at, id);
 CREATE INDEX IF NOT EXISTS idx_recovery_attempts_incident ON quarantine_recovery_attempts(incident_id, attempted_at, id);
 
+CREATE TABLE IF NOT EXISTS quarantine_deletion_attempts (
+    id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL, requested_id TEXT NOT NULL,
+    quarantine_id TEXT REFERENCES quarantine_items(quarantine_id) ON DELETE RESTRICT,
+    incident_id TEXT REFERENCES threat_incidents(id) ON DELETE RESTRICT,
+    attempted_at TEXT NOT NULL, finished_at TEXT,
+    status TEXT NOT NULL CHECK(status IN ('RUNNING', 'DELETED', 'FAILED', 'MISSING', 'REJECTED', 'ALREADY_DELETED')),
+    message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_deletion_history ON quarantine_deletion_attempts(quarantine_id, attempted_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quarantine_deletion_running ON quarantine_deletion_attempts(quarantine_id) WHERE status = 'RUNNING';
+
 CREATE TABLE IF NOT EXISTS cleanup_verifications (id TEXT PRIMARY KEY NOT NULL, incident_id TEXT NOT NULL REFERENCES threat_incidents(id) ON DELETE RESTRICT, sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'), status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'PARTIAL', 'FAILED')), started_at TEXT NOT NULL, finished_at TEXT NOT NULL CHECK (finished_at >= started_at), locations_searched INTEGER NOT NULL CHECK (locations_searched >= 0), quarantined_copies INTEGER NOT NULL CHECK (quarantined_copies >= 0), verified_quarantine_objects INTEGER NOT NULL CHECK (verified_quarantine_objects >= 0), remaining_matching_copies INTEGER NOT NULL CHECK (remaining_matching_copies >= 0), inaccessible_locations INTEGER NOT NULL CHECK (inaccessible_locations >= 0), verification_errors INTEGER NOT NULL CHECK (verification_errors >= 0), details_json TEXT NOT NULL CHECK (length(details_json) > 0), CHECK (verified_quarantine_objects <= quarantined_copies));
 CREATE INDEX IF NOT EXISTS idx_cleanup_verifications_incident ON cleanup_verifications(incident_id, started_at, id);
 """
@@ -58,6 +69,10 @@ class Database:
         with self.connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+            _migrate_scan_processing_order(connection)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(quarantine_items)")}
+            if "deleted_at" not in columns:
+                connection.execute("ALTER TABLE quarantine_items ADD COLUMN deleted_at TEXT")
             _migrate_incident_events_for_phase6(connection)
             _migrate_incident_events_for_phase7(connection)
             _migrate_incident_events_for_phase8(connection)
@@ -65,6 +80,21 @@ class Database:
             _migrate_incident_events_for_phase9(connection)
             _migrate_incident_events_for_phase13(connection)
             _migrate_quarantine_index_for_phase7(connection)
+
+
+def _migrate_scan_processing_order(connection: sqlite3.Connection) -> None:
+    """Do not backfill an invented processing sequence into historical evidence."""
+    session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scan_sessions)")}
+    if "result_order_version" not in session_columns:
+        connection.execute("ALTER TABLE scan_sessions ADD COLUMN result_order_version INTEGER NOT NULL DEFAULT 0")
+    result_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scan_results)")}
+    if "processing_order" not in result_columns:
+        connection.execute("ALTER TABLE scan_results ADD COLUMN processing_order INTEGER CHECK (processing_order IS NULL OR processing_order > 0)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_result_processing_order ON scan_results(session_id, processing_order)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_result_statistics ON scan_results(session_id, result_category, detection_status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_session_detection ON scan_results(session_id, id DESC) WHERE detection_status IN ('HIGH_CONFIDENCE', 'LOW_CONFIDENCE')")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_sessions_type_started ON scan_sessions(scan_type, started_at DESC)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_sessions_status_started ON scan_sessions(status, started_at DESC)")
 
 
 def _migrate_incident_events_for_phase6(connection: sqlite3.Connection) -> None:
