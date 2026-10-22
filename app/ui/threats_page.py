@@ -35,6 +35,9 @@ class ThreatsPage(BasePage):
         self._detail_ref = None
         self._detail_data: dict | None = None
         self._list_data: tuple[dict, ...] | None = None
+        self._selected_refs: set[str] = set()
+        self._bulk_busy = False
+        self._bulk_result = None
         self._render_loading()
 
     def on_show(self) -> None:
@@ -78,6 +81,23 @@ class ThreatsPage(BasePage):
         elif message.kind == "threat_resolved":
             if self._detail_ref and message.payload.get("result", {}).get("threat_ref") == self._detail_ref:
                 self.controller.close_threat_details()
+        elif message.kind == "threats_bulk_completed":
+            result = message.payload.get("result", {})
+            self._bulk_busy = False
+            self._selected_refs.difference_update(result.get("processed", ()))
+            self._list_data = None
+            self.controller.load_threats()
+            total = result.get("total_selected", 0)
+            processed = len(result.get("processed", ()))
+            skipped = result.get("skipped", ())
+            failed = result.get("failed", ())
+            reasons = "; ".join(f"{item['id'][:8]}: {item['reason']}" for item in (*skipped, *failed))
+            self._show_bulk_result(total, processed, len(skipped), len(failed), reasons)
+            self._render(self._list_data or ())
+        elif message.kind == "task_failed" and message.payload.get("task") == "bulk-threat-action":
+            self._bulk_busy = False
+            self._show_bulk_result(len(self._selected_refs), 0, 0, 1, str(message.payload.get("error", "Operation failed.")))
+            if self._list_data is not None: self._render(self._list_data)
         elif message.kind == "threat_details_closed":
             self._detail_ref = None
             self._detail_data = None
@@ -183,11 +203,13 @@ class ThreatsPage(BasePage):
             if section in grouped:
                 grouped[section].append(row)
 
+        self._render_bulk_toolbar(rows)
+
         if not grouped["Needs attention"]:
-            self._empty_attention(0)
-            next_row = 1
+            self._empty_attention(1)
+            next_row = 2
         else:
-            next_row = self._render_section(0, "Needs attention", grouped["Needs attention"])
+            next_row = self._render_section(1, "Needs attention", grouped["Needs attention"])
 
         for section in ("Contained", "Resolved"):
             items = grouped[section]
@@ -232,10 +254,19 @@ class ThreatsPage(BasePage):
             corner_radius=theme.RADIUS,
         )
         card.grid(row=row, column=0, padx=8, pady=5, sticky="ew")
-        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=1)
+        threat_ref = item.get("threat_ref")
+        selectable = bool(threat_ref)
+        if selectable:
+            variable = ctk.BooleanVar(value=threat_ref in self._selected_refs)
+            ctk.CTkCheckBox(card, text="", width=32, variable=variable,
+                            command=lambda ref=threat_ref, value=variable: self._toggle_threat(ref, value.get()),
+                            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+                            border_color=theme.TEXT_MUTED, checkmark_color=theme.BG).grid(
+                                row=0, column=0, rowspan=3, padx=(14, 2), pady=12, sticky="nw")
 
         top = ctk.CTkFrame(card, fg_color="transparent")
-        top.grid(row=0, column=0, columnspan=2, padx=16, pady=(14, 3), sticky="ew")
+        top.grid(row=0, column=1, padx=16, pady=(14, 3), sticky="ew")
         top.grid_columnconfigure(0, weight=1)
         theme.Label(
             top,
@@ -258,7 +289,7 @@ class ThreatsPage(BasePage):
             anchor="w",
             justify="left",
             wraplength=760,
-        ).grid(row=1, column=0, columnspan=2, padx=16, sticky="ew")
+        ).grid(row=1, column=1, padx=16, sticky="ew")
 
         meta_parts = [f"Detected {item.get('detected', 'time unavailable')}"]
         copies = int(item.get("matching_copies", 0) or 0)
@@ -270,9 +301,8 @@ class ThreatsPage(BasePage):
             font=theme.font("body", "normal", theme.FONT),
             text_color=theme.TEXT_DIM,
             anchor="w",
-        ).grid(row=2, column=0, padx=16, pady=(6, 14), sticky="w")
+        ).grid(row=2, column=1, padx=16, pady=(6, 14), sticky="w")
 
-        threat_ref = item.get("threat_ref")
         theme.Button(
             card,
             text=item.get("action", "View details"),
@@ -285,3 +315,65 @@ class ThreatsPage(BasePage):
             border_color=theme.BORDER,
             command=lambda ref=threat_ref: self.controller.open_threat_details(ref),
         ).grid(row=2, column=1, padx=16, pady=(6, 14), sticky="e")
+
+    def _render_bulk_toolbar(self, rows) -> None:
+        refs = {str(row.get("threat_ref")) for row in rows if row.get("threat_ref")}
+        selected_count = len(self._selected_refs)
+        toolbar = ctk.CTkFrame(self.body, fg_color=theme.SURFACE, border_width=1,
+                               border_color=theme.BORDER, corner_radius=theme.RADIUS)
+        toolbar.grid(row=0, column=0, padx=8, pady=(0, 8), sticky="ew")
+        theme.Label(toolbar, text=f"{selected_count} selected", text_color=theme.TEXT,
+                    font=theme.font("body", "bold", theme.FONT)).grid(row=0, column=0, padx=12, pady=9, sticky="w")
+        theme.Button(toolbar, text="Select All", width=90, height=28,
+                     command=lambda: self._set_selection(refs)).grid(row=0, column=1, padx=4, pady=7)
+        theme.Button(toolbar, text="Deselect All", width=95, height=28,
+                     command=lambda: self._set_selection(set())).grid(row=0, column=2, padx=4, pady=7)
+        if selected_count:
+            theme.Button(toolbar, text="Mark as Resolved", width=130, height=28,
+                         command=self._confirm_bulk_resolve, fg_color=theme.ACCENT,
+                         hover_color=theme.ACCENT_HOVER, text_color=theme.BG).grid(row=0, column=3, padx=4, pady=7)
+            theme.Button(toolbar, text="Delete Selected", width=125, height=28,
+                         command=self._confirm_bulk_archive, fg_color=theme.DANGER_DARK,
+                         hover_color=theme.DANGER, text_color=theme.DANGER).grid(row=0, column=4, padx=(4, 12), pady=7)
+        if self._bulk_busy:
+            theme.Label(toolbar, text="Processing selected threats…", text_color=theme.TEXT_MUTED).grid(row=1, column=0, columnspan=5, padx=12, pady=(0, 8), sticky="w")
+        if self._bulk_result:
+            total, processed, skipped, failed, reasons = self._bulk_result
+            summary = f"Bulk result: {total} selected · {processed} processed · {skipped} skipped · {failed} failed"
+            if reasons: summary += f"\n{reasons}"
+            theme.Label(toolbar, text=summary, text_color=theme.WARNING if failed or skipped else theme.SUCCESS,
+                        justify="left", anchor="w", wraplength=800).grid(row=2 if self._bulk_busy else 1, column=0, columnspan=5, padx=12, pady=(0, 8), sticky="w")
+
+    def _toggle_threat(self, ref, checked):
+        if checked: self._selected_refs.add(ref)
+        else: self._selected_refs.discard(ref)
+        if self._list_data is not None: self._render(self._list_data)
+
+    def _set_selection(self, refs):
+        self._selected_refs = set(refs)
+        if self._list_data is not None: self._render(self._list_data)
+
+    def _confirm_bulk_resolve(self):
+        refs = tuple(sorted(self._selected_refs))
+        if not refs or self._bulk_busy: return
+        ConfirmDialog(self.winfo_toplevel(), "Mark selected threats as resolved?",
+                      f"Mark {len(refs)} selected threats as resolved? Only incidents that satisfy the existing resolution requirements will be updated.",
+                      confirm_text="Mark as resolved", on_confirm=lambda: self._start_bulk(refs, "resolve"))
+
+    def _confirm_bulk_archive(self):
+        refs = tuple(sorted(self._selected_refs))
+        if not refs or self._bulk_busy: return
+        ConfirmDialog(self.winfo_toplevel(), "Remove selected threat entries?",
+                      "Remove the selected eligible threat entries from the active list? Historical security records will be retained.",
+                      confirm_text="Remove from list", danger=True,
+                      on_confirm=lambda: self._start_bulk(refs, "archive"))
+
+    def _start_bulk(self, refs, action):
+        if self._bulk_busy: return
+        self._bulk_busy = True
+        self._render(self._list_data or ())
+        if not self.controller.bulk_threat_action(refs, action):
+            self._bulk_busy = False
+
+    def _show_bulk_result(self, total, processed, skipped, failed, reasons):
+        self._bulk_result = (total, processed, skipped, failed, reasons)

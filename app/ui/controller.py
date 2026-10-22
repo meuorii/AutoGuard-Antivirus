@@ -50,6 +50,7 @@ class AutoGuardUIController:
         self._activity_pending = None
         self._activity_reader_running = False
         self._quarantine_delete_busy = False
+        self._threat_bulk_busy = False
 
     def shutdown(self) -> None:
         # Request cooperative interruption of a UI-launched scan before the
@@ -2069,6 +2070,55 @@ class AutoGuardUIController:
             }
 
         self._submit(f"resolve-threat:{ref}", resolve, "threat_resolved")
+
+    def bulk_threat_action(self, threat_refs, action: str) -> bool:
+        """Resolve or archive incidents independently and report every outcome."""
+        refs = tuple(dict.fromkeys(str(ref).strip() for ref in threat_refs if str(ref).strip()))
+        if not refs or action not in {"resolve", "archive"}:
+            return False
+        with self._lock:
+            if self._threat_bulk_busy:
+                return False
+            self._threat_bulk_busy = True
+
+        def run_batch():
+            processed, skipped, failed = [], [], []
+            try:
+                for ref in refs:
+                    try:
+                        details = self.services.incidents.get_incident(ref)
+                        if details is None:
+                            raise KeyError("Incident no longer exists.")
+                        if action == "resolve":
+                            if details.incident.status is IncidentStatus.RESOLVED:
+                                skipped.append({"id": ref, "reason": "Already resolved."})
+                                continue
+                            if details.incident.status is not IncidentStatus.CONTAINED:
+                                raise ValueError("Threat must be contained before it can be resolved.")
+                            self.services.incidents.resolve_verified(
+                                ref, reason="Marked as resolved by the user after verified containment and cleanup."
+                            )
+                        else:
+                            if details.incident.status is not IncidentStatus.RESOLVED:
+                                raise ValueError("Only resolved threats can be removed from the active list.")
+                            self.services.incidents.archive_resolved(ref)
+                        processed.append(ref)
+                    except (KeyError, ValueError) as error:
+                        failed.append({"id": ref, "reason": str(error)})
+                    except Exception as error:
+                        failed.append({"id": ref, "reason": f"{type(error).__name__}: {error}"})
+                return {"action": action, "total_selected": len(refs), "processed": processed,
+                        "skipped": skipped, "failed": failed}
+            finally:
+                with self._lock:
+                    self._threat_bulk_busy = False
+        try:
+            self._submit("bulk-threat-action", run_batch, "threats_bulk_completed")
+        except Exception:
+            with self._lock:
+                self._threat_bulk_busy = False
+            raise
+        return True
 
     def verify_incident_cleanup(self, incident_id: str) -> None:
         self._submit(

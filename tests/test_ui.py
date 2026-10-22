@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from app.models import ScanResult, ScanStatus, ScanSummary, ScanType
 from app.database import Database
+from app.incidents import IncidentStatus
 from app.detector import Detector
 from app.scanner import Scanner
 from app.signatures import SignatureStore
@@ -136,6 +137,38 @@ def test_controller_never_runs_metadata_precount_before_scan():
     try:
         kinds=[m.kind for m in seen];assert "scan_counting" not in kinds and "scan_total" not in kinds;assert kinds.index("scan_started")<kinds.index("scan_discovered")<kinds.index("scan_result")<kinds.index("scan_completed")
     finally:controller.shutdown()
+
+
+def test_bulk_threat_resolution_checks_each_incident_and_reports_partial_results():
+    class Incidents:
+        def __init__(self):
+            self.statuses = {"eligible": IncidentStatus.CONTAINED, "open": IncidentStatus.OPEN}
+            self.transitions = []
+        def get_incident(self, ref):
+            status = self.statuses.get(ref)
+            return None if status is None else SimpleNamespace(incident=SimpleNamespace(status=status))
+        def change_status(self, ref, status, *, reason=None):
+            self.transitions.append((ref, status, reason))
+            self.statuses[ref] = status
+        def resolve_verified(self, ref, *, reason):
+            if self.statuses[ref] is not IncidentStatus.CONTAINED:
+                raise ValueError("not contained")
+            self.transitions.append((ref, IncidentStatus.RESOLVED, reason))
+            self.statuses[ref] = IncidentStatus.RESOLVED
+    incidents = Incidents()
+    bus = UIMessageBus()
+    controller = AutoGuardUIController(SimpleNamespace(incidents=incidents), bus)
+    try:
+        assert controller.bulk_threat_action(("eligible", "open", "missing"), "resolve")
+        message, _ = wait_for(bus, "threats_bulk_completed")
+        result = message.payload["result"]
+        assert result["total_selected"] == 3
+        assert result["processed"] == ["eligible"]
+        assert {item["id"] for item in result["failed"]} == {"open", "missing"}
+        assert incidents.statuses["eligible"] is IncidentStatus.RESOLVED
+        assert incidents.transitions[0][2].startswith("Marked as resolved")
+    finally:
+        controller.shutdown()
 
 
 

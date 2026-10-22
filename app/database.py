@@ -73,6 +73,9 @@ class Database:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(quarantine_items)")}
             if "deleted_at" not in columns:
                 connection.execute("ALTER TABLE quarantine_items ADD COLUMN deleted_at TEXT")
+            incident_columns = {row["name"] for row in connection.execute("PRAGMA table_info(threat_incidents)")}
+            if "archived_at" not in incident_columns:
+                connection.execute("ALTER TABLE threat_incidents ADD COLUMN archived_at TEXT")
             _migrate_incident_events_for_phase6(connection)
             _migrate_incident_events_for_phase7(connection)
             _migrate_incident_events_for_phase8(connection)

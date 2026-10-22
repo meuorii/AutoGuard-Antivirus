@@ -65,3 +65,20 @@ def test_list_incidents_returns_active_and_resolved_without_changing_status(setu
     service, _, detector, files = setup; first = service.record_high_confidence_detection(high_detection(detector, files / "older.txt"), ScanSource.MANUAL); service.change_status(first.id, IncidentStatus.RESOLVED, reason="Finished"); second = service.record_high_confidence_detection(high_detection(detector, files / "newer.txt"), ScanSource.USB); rows = service.list_incidents(10)
     assert {item.id for item in rows} == {first.id, second.id}; assert next(item for item in rows if item.id == first.id).status is IncidentStatus.RESOLVED; assert next(item for item in rows if item.id == second.id).status is IncidentStatus.OPEN
     with pytest.raises(ValueError, match="positive integer"): service.list_incidents(0)
+
+def test_archiving_resolved_incident_hides_list_entry_and_preserves_history(setup):
+    service, database, detector, files = setup
+    incident = service.record_high_confidence_detection(high_detection(detector, files / "archive.txt"), ScanSource.MANUAL)
+    with pytest.raises(ValueError, match="Only resolved"):
+        service.archive_resolved(incident.id)
+    service.change_status(incident.id, IncidentStatus.RESOLVED, reason="Resolved for archive test")
+    archived_at = service.archive_resolved(incident.id)
+    assert archived_at
+    assert all(item.id != incident.id for item in service.list_incidents())
+    assert all(item.incident.id != incident.id for item in service.list_incident_details())
+    history = service.get_incident(incident.id)
+    assert history is not None
+    assert history.incident.status is IncidentStatus.RESOLVED
+    assert any(event.detection_reason == "Resolved for archive test" for event in history.events)
+    with database.connection() as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

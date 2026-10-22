@@ -332,7 +332,7 @@ class IncidentService:
             raise ValueError("limit must be a positive integer.")
         with self.database.connection() as connection:
             rows = connection.execute(
-                """SELECT * FROM threat_incidents
+                """SELECT * FROM threat_incidents WHERE archived_at IS NULL
                    ORDER BY last_observed_at DESC, rowid DESC
                    LIMIT ?""",
                 (limit,),
@@ -352,7 +352,7 @@ class IncidentService:
         with self.database.connection() as connection:
             connection.execute("BEGIN")
             incident_rows = connection.execute(
-                """SELECT * FROM threat_incidents
+                """SELECT * FROM threat_incidents WHERE archived_at IS NULL
                    ORDER BY last_observed_at DESC, rowid DESC
                    LIMIT ?""",
                 (limit,),
@@ -433,6 +433,46 @@ class IncidentService:
                 "SELECT * FROM threat_incidents WHERE id = ?", (incident_id,)
             ).fetchone()
         return _incident(row)
+
+    def archive_resolved(self, incident_id: str) -> str:
+        """Hide a resolved incident from the active Threats list, retaining evidence."""
+        now = _utc_now()
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._require_incident(connection, incident_id)
+            if IncidentStatus(row["status"]) is not IncidentStatus.RESOLVED:
+                raise ValueError("Only resolved incidents can be removed from the active Threats list.")
+            if row["archived_at"]:
+                raise ValueError("Incident is already removed from the active Threats list.")
+            connection.execute("UPDATE threat_incidents SET archived_at = ? WHERE id = ?", (now, incident_id))
+        return now
+
+    def resolve_verified(self, incident_id: str, *, reason: str) -> ThreatIncident:
+        """Atomically resolve only a contained incident with latest verified cleanup."""
+        now = _utc_now()
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._require_incident(connection, incident_id)
+            old = IncidentStatus(row["status"])
+            if old is not IncidentStatus.CONTAINED:
+                raise ValueError("Threat must be contained before it can be resolved.")
+            verification = connection.execute(
+                "SELECT status FROM cleanup_verifications WHERE incident_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+            if verification is None or verification["status"] != "VERIFIED":
+                raise ValueError("Latest cleanup verification is not VERIFIED.")
+            if not reason.strip():
+                raise ValueError("A resolution reason is required.")
+            connection.execute(
+                "UPDATE threat_incidents SET status = ?, updated_at = ? WHERE id = ?",
+                (IncidentStatus.RESOLVED.value, now, incident_id),
+            )
+            self._insert_event(connection, incident_id, IncidentEventType.STATUS_CHANGED, now,
+                               detection_reason=reason, old_status=old,
+                               new_status=IncidentStatus.RESOLVED)
+            updated = connection.execute("SELECT * FROM threat_incidents WHERE id = ?", (incident_id,)).fetchone()
+        return _incident(updated)
 
     def record_high_confidence_detection(
         self, detection: DetectionResult, source: ScanSource
