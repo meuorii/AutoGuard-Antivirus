@@ -31,11 +31,19 @@ _LOCATION_STYLE = {
 class ThreatDetailsView(ctk.CTkFrame):
     """Reusable Threat Details presentation with Locations and Timeline."""
 
+    _TIMELINE_INITIAL = 8
+    # Hard caps: one huge Tk widget (a tall card or a very long label) can exceed the
+    # Windows bitmap limit and fail with "Tk_GetPixmap: Error from CreateDIBSection".
+    _TIMELINE_MAX = 100
+    _LOCATIONS_MAX = 25
+    _RAW_LOG_MAX_LINES = 200
+
     def __init__(self, master, data: dict, *, on_back, on_resolve=None, **kwargs):
         super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
         self._technical_open = False
         self._data = data
         self._on_resolve = on_resolve
+        self._timeline_more = None
         self.grid_columnconfigure(0, weight=1)
         self._build(on_back)
 
@@ -216,6 +224,8 @@ class ThreatDetailsView(ctk.CTkFrame):
             ).grid(row=3, column=0, padx=18, pady=(4, 16), sticky="ew")
             return
 
+        hidden_locations = max(0, len(locations) - self._LOCATIONS_MAX)
+        locations = locations[: self._LOCATIONS_MAX]
         for index, item in enumerate(locations, start=3):
             card = ctk.CTkFrame(section, fg_color=theme.SURFACE_ALT, corner_radius=theme.RADIUS_SMALL)
             card.grid(row=index, column=0, padx=18, pady=(0, 8), sticky="ew")
@@ -279,9 +289,22 @@ class ThreatDetailsView(ctk.CTkFrame):
                 wraplength=790,
             ).grid(row=2, column=0, padx=12, pady=(2, 10), sticky="ew")
 
+        next_row = 3 + len(locations)
+        if hidden_locations:
+            self._locations_more_note(section, next_row, hidden_locations)
+            next_row += 1
         ctk.CTkFrame(section, fg_color="transparent", height=4).grid(
-            row=3 + len(locations), column=0, pady=(0, 4)
+            row=next_row, column=0, pady=(0, 4)
         )
+
+    def _locations_more_note(self, section, row: int, hidden: int) -> None:
+        ctk.CTkLabel(
+            section,
+            text=f"+ {hidden:,} more matching locations not shown. See the Quarantine page for all isolated files.",
+            font=(theme.FONT, 9),
+            text_color=theme.TEXT_DIM,
+            anchor="w",
+        ).grid(row=row, column=0, padx=18, pady=(0, 14), sticky="ew")
 
     def _build_timeline(self, row: int) -> None:
         section = self._card(row)
@@ -301,6 +324,9 @@ class ThreatDetailsView(ctk.CTkFrame):
         ).grid(row=1, column=0, padx=18, pady=(0, 12), sticky="ew")
 
         timeline = tuple(self._data.get("timeline", ()))
+        total_events = len(timeline)
+        if total_events > self._TIMELINE_MAX:
+            timeline = timeline[-self._TIMELINE_MAX:]
         if not timeline:
             ctk.CTkLabel(
                 section,
@@ -311,55 +337,116 @@ class ThreatDetailsView(ctk.CTkFrame):
             ).grid(row=2, column=0, padx=18, pady=(2, 16), sticky="ew")
             return
 
-        for index, item in enumerate(timeline, start=2):
-            line = ctk.CTkFrame(section, fg_color="transparent")
-            line.grid(row=index, column=0, padx=18, pady=(0, 12), sticky="ew")
-            line.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(
-                line,
-                text="●",
-                width=18,
-                font=(theme.FONT, 10),
-                text_color=theme.ACCENT,
-                anchor="n",
-            ).grid(row=0, column=0, padx=(0, 8), sticky="n")
-
-            body = ctk.CTkFrame(line, fg_color="transparent")
-            body.grid(row=0, column=1, sticky="ew")
-            body.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                body,
-                text=("Threat resolved" if item.get("label") == "Incident resolved" else item.get("label", "Threat activity recorded")),
-                font=(theme.FONT, 10, "bold"),
+        # Building every timeline row with CustomTkinter widgets is the slowest part of
+        # this page (about 0.02 s per event), so show the newest events first and let
+        # the user expand the rest on demand.
+        hidden = max(0, len(timeline) - self._TIMELINE_INITIAL)
+        visible = timeline[-self._TIMELINE_INITIAL:] if hidden else timeline
+        first_row = 2
+        if hidden:
+            self._timeline_more = ctk.CTkButton(
+                section,
+                text=f"Show {hidden:,} earlier {'event' if hidden == 1 else 'events'}",
+                width=170,
+                height=28,
+                fg_color=theme.SURFACE_ALT,
+                hover_color=theme.SURFACE_HOVER,
                 text_color=theme.TEXT,
-                anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
+                border_width=1,
+                border_color=theme.BORDER,
+                command=lambda: self._expand_timeline(section, timeline),
+            )
+            self._timeline_more.grid(row=2, column=0, padx=18, pady=(0, 12), sticky="w")
+            first_row = 3
+        for index, item in enumerate(visible, start=first_row):
+            self._timeline_line(section, index, item)
+        self._timeline_total = total_events
+
+    def _expand_timeline(self, section, timeline) -> None:
+        """Render the remaining (older) events in small batches so the UI stays responsive."""
+        if self._timeline_more is not None:
+            self._timeline_more.configure(text="Loading earlier events…", state="disabled")
+        older = timeline[:-self._TIMELINE_INITIAL]
+        shown = timeline[-self._TIMELINE_INITIAL:]
+        # Re-grid the already-visible rows after the older ones by shifting their rows.
+        base = 3
+        children = [w for w in section.winfo_children() if int(w.grid_info().get("row", 0)) >= base]
+        for widget in children:
+            info = widget.grid_info()
+            widget.grid_configure(row=int(info["row"]) + len(older))
+
+        def render(start: int = 0) -> None:
+            if not section.winfo_exists():
+                return
+            for offset, item in enumerate(older[start:start + 8], start=start):
+                self._timeline_line(section, base + offset, item)
+            if start + 8 < len(older):
+                self.after(10, lambda: render(start + 8))
+            else:
+                if self._timeline_more is not None:
+                    self._timeline_more.destroy()
+                    self._timeline_more = None
+                total = getattr(self, "_timeline_total", len(timeline))
+                if total > len(timeline):
+                    ctk.CTkLabel(
+                        section,
+                        text=f"Showing the latest {len(timeline):,} of {total:,} recorded events.",
+                        font=(theme.FONT, 9),
+                        text_color=theme.TEXT_DIM,
+                        anchor="w",
+                    ).grid(row=2, column=0, padx=18, pady=(0, 10), sticky="w")
+
+        render()
+
+    def _timeline_line(self, section, row: int, item: dict) -> None:
+        line = ctk.CTkFrame(section, fg_color="transparent")
+        line.grid(row=row, column=0, padx=18, pady=(0, 12), sticky="ew")
+        line.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            line,
+            text="●",
+            width=18,
+            font=(theme.FONT, 10),
+            text_color=theme.ACCENT,
+            anchor="n",
+        ).grid(row=0, column=0, padx=(0, 8), sticky="n")
+
+        body = ctk.CTkFrame(line, fg_color="transparent")
+        body.grid(row=0, column=1, sticky="ew")
+        body.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            body,
+            text=("Threat resolved" if item.get("label") == "Incident resolved" else item.get("label", "Threat activity recorded")),
+            font=(theme.FONT, 10, "bold"),
+            text_color=theme.TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            body,
+            text=item.get("time", "Time unavailable"),
+            font=(theme.FONT, 9),
+            text_color=theme.TEXT_DIM,
+            anchor="e",
+        ).grid(row=0, column=1, padx=(12, 0), sticky="e")
+        ctk.CTkLabel(
+            body,
+            text=item.get("explanation", ""),
+            font=(theme.FONT, 9),
+            text_color=theme.TEXT_MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=730,
+        ).grid(row=1, column=0, columnspan=2, pady=(2, 0), sticky="ew")
+        if item.get("path"):
             ctk.CTkLabel(
                 body,
-                text=item.get("time", "Time unavailable"),
-                font=(theme.FONT, 9),
+                text=item["path"],
+                font=(theme.FONT_MONO, 8),
                 text_color=theme.TEXT_DIM,
-                anchor="e",
-            ).grid(row=0, column=1, padx=(12, 0), sticky="e")
-            ctk.CTkLabel(
-                body,
-                text=item.get("explanation", ""),
-                font=(theme.FONT, 9),
-                text_color=theme.TEXT_MUTED,
                 anchor="w",
                 justify="left",
                 wraplength=730,
-            ).grid(row=1, column=0, columnspan=2, pady=(2, 0), sticky="ew")
-            if item.get("path"):
-                ctk.CTkLabel(
-                    body,
-                    text=item["path"],
-                    font=(theme.FONT_MONO, 8),
-                    text_color=theme.TEXT_DIM,
-                    anchor="w",
-                    justify="left",
-                    wraplength=730,
-                ).grid(row=2, column=0, columnspan=2, pady=(3, 0), sticky="ew")
+            ).grid(row=2, column=0, columnspan=2, pady=(3, 0), sticky="ew")
 
     def _build_technical_details(self, row: int) -> None:
         wrapper = ctk.CTkFrame(
@@ -389,6 +476,13 @@ class ThreatDetailsView(ctk.CTkFrame):
         self._technical_frame = ctk.CTkFrame(wrapper, fg_color="transparent")
         self._technical_frame.grid_columnconfigure(1, weight=1)
         for index, (label, value) in enumerate(self._data.get("technical_details", ())):
+            if label == "Incident events":
+                lines = str(value).split("\n")
+                if len(lines) > self._RAW_LOG_MAX_LINES:
+                    value = (
+                        f"Showing the latest {self._RAW_LOG_MAX_LINES} of {len(lines):,} recorded events\n"
+                        + "\n".join(lines[-self._RAW_LOG_MAX_LINES:])
+                    )
             ctk.CTkLabel(
                 self._technical_frame,
                 text=label,

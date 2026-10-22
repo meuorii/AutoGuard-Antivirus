@@ -56,7 +56,8 @@ STATE_CHANGE_TARGETS = {
     "scan_stopped": {"home", "scan", "activity"},
     "scan_completed": {"home", "scan", "threats", "quarantine", "activity"},
     "scan_batch_completed": {"home", "scan", "threats", "quarantine", "activity"},
-    "scan_result_ready": {"home", "scan", "threats", "quarantine", "activity"},
+    # Per-file results can arrive rapidly; Activity reloads once at scan completion.
+    "scan_result_ready": {"home", "scan", "threats", "quarantine"},
     "incident_verified": {"home", "threats", "activity"},
     "threat_resolved": {"home", "threats", "activity"},
     "quarantine_verified": {"quarantine"},
@@ -64,7 +65,7 @@ STATE_CHANGE_TARGETS = {
     "recovery_completed": {"home", "threats", "quarantine", "activity"},
     "settings_applied": {"home", "settings"},
 }
-PASSIVE_REFRESH_PAGES = {"home", "threats", "quarantine", "activity", "settings"}
+PASSIVE_REFRESH_PAGES = {"home", "threats", "quarantine", "settings"}
 GLOBAL_STATUS_EVENTS = {
     "scan_started", "scan_stopped", "scan_completed", "scan_batch_completed",
     "scan_result_ready", "incident_verified", "threat_resolved", "quarantine_deleted",
@@ -104,7 +105,11 @@ class MainWindow(ctk.CTk):
         # tray is enabled so the application can never become unreachable.
         self._hidden_to_tray = bool(start_hidden and enable_system_tray)
         self._active_page: str | None = None
-        self.tray = SystemTray(services, enabled=enable_system_tray)
+        self.tray = SystemTray(
+            services,
+            enabled=enable_system_tray,
+            ui_scan_provider=self.controller.ui_scan_progress,
+        )
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)

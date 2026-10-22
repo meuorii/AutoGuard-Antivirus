@@ -83,6 +83,29 @@ class RecoveryService:
             rows = conn.execute(query, params).fetchall()
         return [_attempt(row) for row in rows]
 
+    def list_attempts_for_quarantines(
+        self, quarantine_ids: tuple[str, ...] | list[str]
+    ) -> list[RecoveryAttempt]:
+        """Fetch recovery history for multiple quarantine objects in one query."""
+        ids = tuple(dict.fromkeys(str(value) for value in quarantine_ids if value))
+        if not ids:
+            return []
+        results: list[RecoveryAttempt] = []
+        chunk_size = 900  # Stay below SQLite's common bound-parameter limit.
+        with self.database.connection() as conn:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""SELECT * FROM quarantine_recovery_attempts
+                        WHERE quarantine_id IN ({placeholders})
+                        ORDER BY attempted_at, rowid""",
+                    chunk,
+                ).fetchall()
+                results.extend(_attempt(row) for row in rows)
+        results.sort(key=lambda attempt: (attempt.attempted_at, attempt.id))
+        return results
+
     def _detect_for_destination(self, stored_path: Path, destination: Path) -> DetectionResult:
         preview_bytes = SCRIPT_PREVIEW_BYTES if destination.suffix.lower() in SCRIPT_EXTENSIONS else 0
         inspection = inspect_file(stored_path, preview_bytes=preview_bytes, follow_symlinks=False)

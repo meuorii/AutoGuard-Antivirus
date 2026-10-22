@@ -68,8 +68,10 @@ class SystemTray:
         enabled: bool = True,
         platform_name: str | None = None,
         icon_factory: Callable[["SystemTray"], Any] | None = None,
+        ui_scan_provider: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self.services = services
+        self._ui_scan_provider = ui_scan_provider
         self.enabled = bool(enabled)
         self.platform_name = os.name if platform_name is None else platform_name
         self._icon_factory = icon_factory
@@ -200,6 +202,18 @@ class SystemTray:
                     active_label = str(getattr(progress, "label", "Automatic Scan"))
                     files_checked = int(getattr(progress, "files_checked", 0))
                     threats_found = int(getattr(progress, "threats_found", 0))
+            except Exception:
+                pass
+
+        # Scans started from the AutoGuard window (Quick/Full/Custom) are owned by the UI
+        # controller, not the scheduler, so the scheduler alone never reports them.
+        if active_label is None and self._ui_scan_provider is not None:
+            try:
+                ui_scan = self._ui_scan_provider()
+                if ui_scan:
+                    active_label = str(ui_scan.get("label", "Scan"))
+                    files_checked = int(ui_scan.get("files_checked", 0))
+                    threats_found = int(ui_scan.get("threats_found", 0))
             except Exception:
                 pass
 

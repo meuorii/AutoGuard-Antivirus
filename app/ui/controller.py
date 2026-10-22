@@ -44,6 +44,7 @@ class AutoGuardUIController:
         self._active_tasks: set[str] = set()
         self._scan_cancel_events: dict[str, threading.Event] = {}
         self._current_scan_task: str | None = None
+        self._ui_scan_status: dict[str, Any] | None = None
         self._selected_threat_ref: str | None = None
         self._selected_quarantine_ref: str | None = None
 
@@ -87,6 +88,7 @@ class AutoGuardUIController:
                     self._scan_cancel_events.pop(task_name, None)
                     if self._current_scan_task == task_name:
                         self._current_scan_task = None
+                        self._ui_scan_status = None
                 self.bus.publish("task_finished", task=task_name, active_tasks=self.active_tasks())
 
         self._executor.submit(runner)
@@ -637,12 +639,20 @@ class AutoGuardUIController:
         return self._selected_threat_ref
 
     def open_threat_details(self, threat_ref: str) -> None:
-        """Select an internal incident reference and open its user-facing details."""
-        if not threat_ref:
+        """Select a threat and navigate to its details in the Threats page.
+
+        Set the selected reference before navigation so ThreatsPage.on_show()
+        can load the correct model. The request event also updates an already
+        mounted ThreatsPage. Duplicate reads are suppressed by _submit_once().
+        """
+        ref = str(threat_ref or "").strip()
+        if not ref:
             return
-        self._selected_threat_ref = str(threat_ref)
-        self.bus.publish("threat_details_requested", threat_ref=self._selected_threat_ref)
+
+        self._selected_threat_ref = ref
+        print(f"[AutoGuard DEBUG] Opening threat details: {ref}", flush=True)
         self.navigate_to("threats")
+        self.bus.publish("threat_details_requested", threat_ref=ref)
 
     def close_threat_details(self) -> None:
         """Return the Threats destination to its list state."""
@@ -653,12 +663,20 @@ class AutoGuardUIController:
         """Load one evidence-backed Threat Details read model off the UI thread."""
         ref = str(threat_ref or self._selected_threat_ref or "").strip()
         if not ref:
+            print(
+                "[AutoGuard DEBUG] Details load skipped: no selected threat reference",
+                flush=True,
+            )
             return
-        self._submit_once(
-            f"load-threat-details:{ref}",
+
+        task_name = f"load-threat-details:{ref}"
+        print(f"[AutoGuard DEBUG] load_threat_details called: {task_name}", flush=True)
+        submitted = self._submit_once(
+            task_name,
             lambda: self._threat_details_snapshot(ref),
             "threat_details_data",
         )
+        print(f"[AutoGuard DEBUG] Details task submitted: {submitted}", flush=True)
 
     @staticmethod
     def _location_key(path: str) -> str:
@@ -938,7 +956,21 @@ class AutoGuardUIController:
             IncidentStatus.RESOLVED: "resolved",
         }[incident.status]
 
-        detection = self.services.scanner.history.latest_detection_for_sha256(incident.sha256)
+        # Detection history enriches the explanation, but it is optional for
+        # rendering incident details. Continue with persisted incident evidence
+        # if the history lookup raises an error.
+        detection = None
+        try:
+            history = getattr(getattr(self.services, "scanner", None), "history", None)
+            lookup = getattr(history, "latest_detection_for_sha256", None)
+            if callable(lookup):
+                detection = lookup(incident.sha256)
+        except Exception as error:
+            print(
+                "[AutoGuard DEBUG] Latest detection lookup failed; continuing "
+                f"without detection metadata: {type(error).__name__}: {error}",
+                flush=True,
+            )
         quarantine_items = tuple(
             item for item in self.services.quarantine.list_quarantined_items()
             if item.incident_id == incident.id and item.sha256 == incident.sha256
@@ -1313,15 +1345,28 @@ class AutoGuardUIController:
         }
 
     # ---------- Unified Activity read model ----------
-    _ACTIVITY_SCAN_LIMIT = 180
+    _ACTIVITY_SCAN_LIMIT = 60
     _ACTIVITY_INCIDENT_LIMIT = 120
     _ACTIVITY_OUTPUT_LIMIT = 350
+    _ACTIVITY_FILE_LIMIT = 40
 
     def load_activity(self) -> None:
         """Load the unified user-facing activity feed off the UI thread."""
         if "load-activity" in self.active_tasks():
             return
-        self._submit("load-activity", self._activity_snapshot, "activity_data")
+
+        def run() -> list[dict[str, Any]]:
+            started = time.monotonic()
+            try:
+                return self._activity_snapshot()
+            finally:
+                print(
+                    f"[AutoGuard DEBUG] activity snapshot took "
+                    f"{time.monotonic() - started:.2f}s",
+                    flush=True,
+                )
+
+        self._submit("load-activity", run, "activity_data")
 
     @staticmethod
     def _activity_local_time(value: Any) -> datetime | None:
@@ -1358,7 +1403,7 @@ class AutoGuardUIController:
         such transitions are intentionally absent rather than invented.
         """
         events: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str, int]] = set()
+        seen: set[tuple[str, str, str, int, int | None]] = set()
 
         def add(
             category: str,
@@ -1367,6 +1412,7 @@ class AutoGuardUIController:
             *,
             detail: str = "",
             tone: str = "info",
+            detection_number: int | None = None,
         ) -> None:
             local = self._activity_local_time(when)
             if local is None:
@@ -1376,7 +1422,7 @@ class AutoGuardUIController:
             except Exception:
                 return
             safe_detail = str(detail or "").strip()
-            key = (category, title, safe_detail.casefold(), int(stamp))
+            key = (category, title, safe_detail.casefold(), int(stamp), detection_number)
             if key in seen:
                 return
             seen.add(key)
@@ -1385,6 +1431,7 @@ class AutoGuardUIController:
                 "title": title,
                 "detail": safe_detail,
                 "tone": tone,
+                "detection_number": detection_number,
                 "_sort_time": stamp,
                 "_when": local,
             })
@@ -1392,7 +1439,17 @@ class AutoGuardUIController:
         # Threat/quarantine/cleanup/recovery activity is already recorded in the
         # incident timeline. Keep that service authoritative rather than reading
         # incident tables from the presentation layer.
-        incidents = tuple(self.services.incidents.list_incidents(self._ACTIVITY_INCIDENT_LIMIT))
+        incident_details_by_id: dict[str, Any] | None = None
+        if hasattr(self.services.incidents, "list_incident_details"):
+            incident_details = tuple(
+                self.services.incidents.list_incident_details(self._ACTIVITY_INCIDENT_LIMIT)
+            )
+            incident_details_by_id = {item.incident.id: item for item in incident_details}
+            incidents = tuple(item.incident for item in incident_details)
+        else:
+            incidents = tuple(
+                self.services.incidents.list_incidents(self._ACTIVITY_INCIDENT_LIMIT)
+            )
         incident_shas = {incident.sha256 for incident in incidents}
         meaningful_incident_events = {
             IncidentEventType.FIRST_OBSERVED,
@@ -1414,8 +1471,33 @@ class AutoGuardUIController:
             IncidentEventType.RECOVERY_SUCCEEDED,
             IncidentEventType.STATUS_CHANGED,
         }
+        history = self.services.scanner.history
+        file_results: list[dict[str, Any]] = []
+        file_results_loaded = False
+        if hasattr(history, "recent_file_results"):
+            t0 = time.monotonic()
+            try:
+                file_results = list(history.recent_file_results(self._ACTIVITY_FILE_LIMIT))
+                file_results_loaded = True
+            except Exception:
+                # Fall back to the older per-session reads if the batched query fails.
+                file_results = []
+            print(
+                f"[AutoGuard DEBUG] recent_file_results took {time.monotonic() - t0:.2f}s",
+                flush=True,
+            )
+
+        detection_number_by_path: dict[str, int] = {}
+        for item in file_results:
+            result = item["result"]
+            detection_number_by_path[str(result.path).casefold()] = int(item["detection_number"])
+
         for incident in incidents:
-            details = self.services.incidents.get_incident(incident.id)
+            details = (
+                incident_details_by_id.get(incident.id)
+                if incident_details_by_id is not None
+                else self.services.incidents.get_incident(incident.id)
+            )
             if details is None:
                 continue
             for event in details.events:
@@ -1446,12 +1528,41 @@ class AutoGuardUIController:
                         IncidentEventType.MATCHING_CLEANUP_FAILED,
                     ) else "success"
                 )
-                add("Threats", title, event.occurred_at, detail=detail, tone=tone)
+                detection_number = detection_number_by_path.get(str(path).casefold()) if path else None
+                add(
+                    "Threats", title, event.occurred_at, detail=detail, tone=tone,
+                    detection_number=detection_number,
+                )
 
-        # Scan lifecycle and file-monitor evidence come from persisted scan
-        # history. Expensive per-session result reads are only performed when
-        # a real-time file event or recorded detection requires them.
-        history = self.services.scanner.history
+        # Each persisted scanned file appears in the feed, not only threats.
+        # The scan-history query supplies global, durable ordinals and is bounded
+        # to the latest file outcomes to keep Activity rendering responsive.
+        if file_results:
+            for item in file_results:
+                result = item["result"]
+                number = int(item["detection_number"])
+                status = result.detection_status
+                if status is DetectionStatus.LOW_CONFIDENCE:
+                    # The suspicious detection row already has the right semantics.
+                    # Avoid a duplicate if a future source also records this path as an incident.
+                    add(
+                        "Threats", "Suspicious file detected", result.recorded_at,
+                        detail=result.path, tone="warning", detection_number=number,
+                    )
+                elif status is DetectionStatus.HIGH_CONFIDENCE:
+                    # Canonical incident timeline rows above carry the same number.
+                    if not result.sha256 or result.sha256 not in incident_shas:
+                        add(
+                            "Threats", "Confirmed threat detected", result.recorded_at,
+                            detail=result.path, tone="danger", detection_number=number,
+                        )
+                else:
+                    add(
+                        "Scans", "File scanned", result.recorded_at,
+                        detail=result.path, tone="success", detection_number=number,
+                    )
+
+        # Scan lifecycle summaries remain useful; file outcomes are loaded in one bounded query above.
         sessions = tuple(history.recent_scans(self._ACTIVITY_SCAN_LIMIT))
         for session in sessions:
             if session.scan_type in (ScanType.MATCHING_COPY, ScanType.RECOVERY):
@@ -1461,9 +1572,12 @@ class AutoGuardUIController:
 
             counters = session.counters
             needs_details = (
-                session.scan_type is ScanType.REAL_TIME
-                or int(counters.get("suspicious_detections", 0) or 0) > 0
-                or int(counters.get("dangerous_detections", 0) or 0) > 0
+                not file_results_loaded
+                and (
+                    session.scan_type is ScanType.REAL_TIME
+                    or int(counters.get("suspicious_detections", 0) or 0) > 0
+                    or int(counters.get("dangerous_detections", 0) or 0) > 0
+                )
             )
             details = history.get_scan(session.id) if needs_details else None
             detected = False
@@ -1487,7 +1601,7 @@ class AutoGuardUIController:
                             )
 
             if session.scan_type is ScanType.REAL_TIME:
-                if not detected:
+                if not detected and not file_results_loaded:
                     add(
                         "Scans", "File scanned",
                         session.finished_at or session.started_at,
@@ -1591,6 +1705,11 @@ class AutoGuardUIController:
                 event = threading.Event()
                 self._current_scan_task = task
                 self._scan_cancel_events[task] = event
+                self._ui_scan_status = {
+                    "label": {"quick-scan": "Quick Scan", "full-scan": "Full Scan"}.get(task, "Custom Scan"),
+                    "files_checked": 0,
+                    "threats_found": 0,
+                }
                 return event
         self.bus.publish(
             "scan_rejected",
@@ -1599,6 +1718,11 @@ class AutoGuardUIController:
             reason="Another scan is already running.",
         )
         return None
+
+    def ui_scan_progress(self) -> dict[str, Any] | None:
+        """Snapshot of a scan started from this window (Quick/Full/Custom), for the tray."""
+        with self._lock:
+            return dict(self._ui_scan_status) if self._ui_scan_status is not None else None
 
     def stop_scan(self) -> bool:
         """Request safe cooperative interruption of the current UI-launched scan."""
@@ -1658,6 +1782,10 @@ class AutoGuardUIController:
             elif detection is DetectionStatus.HIGH_CONFIDENCE:
                 state["dangerous"] += 1
                 force = True
+        with self._lock:
+            if self._ui_scan_status is not None and self._current_scan_task == task:
+                self._ui_scan_status["files_checked"] = state["processed"]
+                self._ui_scan_status["threats_found"] = state["dangerous"]
         first = state["last_emit"] == 0.0
         first_result = result is not None and not state["result_emitted"]
         if first_result:

@@ -24,6 +24,36 @@
       "sha256": "630493e71139b4d4c3ac50b52b0f967b4d338ee7c2950d64ff8ff147d7f7442f",
       "kind": "autoguard_test",
       "description": "Harmless local fixture used to verify AutoGuard signature detection; this is not real malware."
+    },
+    {
+      "name": "Test.ILOVEYOU",
+      "sha256": "eb1eb3c7db3ce9658cc5262e267567e43ede45467250f1b833860e183fa50ace",
+      "kind": "known_malicious",
+      "description": "Harmless AutoGuard test content; not malware."
+    },
+    {
+      "name": "Test.Melissa",
+      "sha256": "5bfe8dd623514ecaf6e60a041aa9bf1267968fc54222160455afb8c35c618f93",
+      "kind": "known_malicious",
+      "description": "Harmless AutoGuard test content; not malware."
+    },
+    {
+      "name": "Test.CodeRed",
+      "sha256": "ebede7a0082710a7c795c3d4ded1e7b95c573fdd06dfa08ae98c3ae8a7503fb4",
+      "kind": "known_malicious",
+      "description": "Harmless AutoGuard test content; not malware."
+    },
+    {
+      "name": "Test.Nimda",
+      "sha256": "e2121ec19501b67f7367220b2aea0d2a3a46f2d0fc31b25786809d1f4aae52b0",
+      "kind": "known_malicious",
+      "description": "Harmless AutoGuard test content; not malware."
+    },
+    {
+      "name": "Test.Zeus",
+      "sha256": "ea2c88a8023ceaeecf6169598caee37b752fc39dd4219d6c1ec98df55dd6bb89",
+      "kind": "known_malicious",
+      "description": "Harmless AutoGuard test content; not malware."
     }
   ]
 }

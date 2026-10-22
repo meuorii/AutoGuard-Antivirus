@@ -16,6 +16,13 @@ _TONE_COLORS = {
     "info": theme.INFO,
 }
 
+# While a scan is running and the Activity page is visible, reload the feed
+# this often (milliseconds). Set to 0 to disable live polling.
+LIVE_POLL_MS = 4000
+# If a load has not answered after this long, stop showing "Loading" forever
+# and let the user retry.
+LOAD_TIMEOUT_MS = 20000
+
 
 class ActivityPage(BasePage):
     title = "Activity"
@@ -26,40 +33,128 @@ class ActivityPage(BasePage):
         self._events: list[dict] = []
         self._filter = "All"
         self._loading = True
+        self._error: str | None = None
+        self._reload_pending = False
+        self._watchdog_id = None
         self._render()
+        if LIVE_POLL_MS > 0:
+            self.after(LIVE_POLL_MS, self._poll)
 
+    # ------------------------------------------------------------------ loading
     def on_show(self) -> None:
+        # Always load right away. Activity no longer waits for a scan to finish;
+        # SQLite runs in WAL mode so reads are safe while a scan is writing.
         self.refresh()
 
+    def _scan_in_progress(self) -> bool:
+        """Return whether a UI-launched or automatic scan is currently active."""
+        try:
+            active_tasks = self.controller.active_tasks()
+            if any(
+                task == "quick-scan" or task == "full-scan" or task.startswith("scan:")
+                for task in active_tasks
+            ):
+                return True
+            return self.controller.automatic_scan_progress() is not None
+        except Exception:
+            return False
+
+    def _load_in_flight(self) -> bool:
+        try:
+            return "load-activity" in self.controller.active_tasks()
+        except Exception:
+            return False
+
+    def _request_reload(self, *, pending_if_busy: bool) -> None:
+        """Start a load, or remember to reload once the running one finishes.
+
+        The controller drops load requests while one is running. Without the
+        pending flag, a scan-stopped refresh that arrives during an older load
+        would be lost and the page would keep stale/empty data.
+        """
+        if self._load_in_flight():
+            if pending_if_busy:
+                self._reload_pending = True
+            return
+        self._arm_watchdog()
+        self.controller.load_activity()
+
+    def refresh(self) -> None:
+        self._error = None
+        # Only show the full "Loading" card when there is nothing to display.
+        # Existing events stay visible while the new data loads.
+        self._loading = not self._events
+        self._render()
+        self._request_reload(pending_if_busy=False)
+
+    def refresh_from_state(self, reason: str = "") -> None:
+        # Event-driven sync (scan stopped/completed, etc.). No loading flash.
+        self._request_reload(pending_if_busy=True)
+
+    def _arm_watchdog(self) -> None:
+        self._cancel_watchdog()
+        try:
+            self._watchdog_id = self.after(LOAD_TIMEOUT_MS, self._on_load_timeout)
+        except Exception:
+            self._watchdog_id = None
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog_id is not None:
+            try:
+                self.after_cancel(self._watchdog_id)
+            except Exception:
+                pass
+            self._watchdog_id = None
+
+    def _on_load_timeout(self) -> None:
+        self._watchdog_id = None
+        if self._loading:
+            self._loading = False
+            self._error = "Activity is taking too long to load. Press Refresh to try again."
+            self._render()
+
+    def _poll(self) -> None:
+        """Keep the feed live while a scan runs and this page is visible."""
+        try:
+            if (
+                self.winfo_ismapped()
+                and not self._loading
+                and self._scan_in_progress()
+            ):
+                self._request_reload(pending_if_busy=False)
+        except Exception:
+            pass
+        try:
+            self.after(LIVE_POLL_MS, self._poll)
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------- messages
     def handle_message(self, message) -> None:
         if message.kind == "activity_data":
+            self._cancel_watchdog()
             events = list(message.payload.get("result", ()))
-            was_loading = self._loading
+            needs_render = self._loading or self._error is not None or events != self._events
             self._loading = False
-            if was_loading or events != self._events:
+            self._error = None
+            if needs_render:
                 self._events = events
                 self._render()
         elif message.kind == "task_failed" and message.payload.get("task") == "load-activity":
+            self._cancel_watchdog()
             self._loading = False
-            self._render(error=message.payload.get("error", "Activity could not be loaded."))
-        elif message.kind in {
-            "scan_result_ready", "scan_stopped", "incident_verified",
-            "quarantine_deleted", "recovery_completed",
-        }:
-            # Persisted evidence changed. Refresh only when this page next becomes
-            # visible or when the user chooses Refresh; no expensive polling loop.
-            pass
+            self._error = message.payload.get("error", "Activity could not be loaded.")
+            self._render()
+        elif message.kind == "task_finished" and message.payload.get("task") == "load-activity":
+            # A reload was requested while the previous load was still running.
+            if self._reload_pending:
+                self._reload_pending = False
+                self._request_reload(pending_if_busy=True)
+        # Other lifecycle events (scan_stopped, scan_completed, ...) are routed by
+        # MainWindow to refresh_from_state() when this page is visible, and
+        # on_show() reloads when the page is opened later.
 
-    def refresh(self) -> None:
-        self._loading = True
-        self._render()
-        self.controller.load_activity()
-
-    def refresh_from_state(self, reason: str = "") -> None:
-        # Passive/event synchronization keeps the current feed visible while an
-        # off-thread read model refreshes; no loading flash on every update.
-        self.controller.load_activity()
-
+    # ------------------------------------------------------------------- render
     def _set_filter(self, value: str) -> None:
         if value not in _FILTERS:
             return
@@ -87,15 +182,17 @@ class ActivityPage(BasePage):
             text_color=theme.TEXT,
             border_width=1,
             corner_radius=theme.RADIUS_SMALL,
-            font=(theme.FONT, 10, "bold"),
+            font=(theme.FONT, 12, "bold"),
+            height=34,
         )
         segmented.grid(row=0, column=0, sticky="w")
         segmented.set(self._filter)
         ctk.CTkButton(
             bar,
             text="Refresh",
-            width=84,
-            height=30,
+            width=96,
+            height=34,
+            font=(theme.FONT, 12),
             fg_color=theme.SURFACE,
             hover_color=theme.SURFACE_HOVER,
             border_width=1,
@@ -104,20 +201,26 @@ class ActivityPage(BasePage):
             command=self.refresh,
         ).grid(row=0, column=1, sticky="e")
 
-    def _render(self, *, error: str | None = None) -> None:
+    def _render(self) -> None:
         self.clear_body()
         self.body.grid_columnconfigure(0, weight=1)
         self._toolbar()
 
-        if self._loading:
-            self._state_card("Loading activity…", "AutoGuard is reading recorded activity in the background.")
-            return
-        if error:
-            self._state_card("Activity could not be loaded", error, tone="danger")
+        if self._loading and not self._events:
+            self._state_card(
+                "Loading activity…",
+                "AutoGuard is reading recorded activity in the background.",
+            )
             return
 
         events = self._filtered_events()
+
+        if self._error and not self._events:
+            self._state_card("Activity could not be loaded", self._error, tone="danger")
+            return
+
         if not events:
+            scanning = self._scan_in_progress()
             if self._filter == "Protection":
                 self._state_card(
                     "No recorded protection changes",
@@ -131,12 +234,16 @@ class ActivityPage(BasePage):
             elif self._filter == "Scans":
                 self._state_card(
                     "No scan activity recorded",
-                    "Run a scan or let real-time protection monitor supported locations to build activity history.",
+                    "A scan is running. Its activity will appear here as it is saved."
+                    if scanning
+                    else "Run a scan or let real-time protection monitor supported locations to build activity history.",
                 )
             else:
                 self._state_card(
                     "No activity has been recorded yet",
-                    "AutoGuard will show recorded scans and security activity here as they occur.",
+                    "A scan is running. Its activity will appear here as it is saved."
+                    if scanning
+                    else "AutoGuard will show recorded scans and security activity here as they occur.",
                 )
             return
 
@@ -149,7 +256,7 @@ class ActivityPage(BasePage):
                 ctk.CTkLabel(
                     self.body,
                     text=group,
-                    font=(theme.FONT, 13, "bold"),
+                    font=(theme.FONT, 17, "bold"),
                     text_color=theme.TEXT,
                     anchor="w",
                 ).grid(row=row_index, column=0, padx=10, pady=(15 if row_index > 1 else 2, 5), sticky="ew")
@@ -177,41 +284,52 @@ class ActivityPage(BasePage):
         ctk.CTkLabel(
             card,
             text="●",
-            font=(theme.FONT, 13, "bold"),
+            font=(theme.FONT, 16, "bold"),
             text_color=color,
-            width=24,
+            width=28,
         ).grid(row=0, column=0, rowspan=2, padx=(14, 6), pady=12, sticky="n")
         ctk.CTkLabel(
             card,
             text=event.get("title", "Activity recorded"),
-            font=(theme.FONT, 11, "bold"),
+            font=(theme.FONT, 14, "bold"),
             text_color=theme.TEXT,
             anchor="w",
         ).grid(row=0, column=1, padx=(0, 8), pady=(11, 2), sticky="ew")
+        detection_number = event.get("detection_number")
+        if detection_number is not None:
+            ctk.CTkLabel(
+                card,
+                text=f"DETECTION #{int(detection_number):03d}",
+                font=(theme.FONT, 10, "bold"),
+                text_color=theme.ACCENT,
+                fg_color=theme.SURFACE_HOVER,
+                corner_radius=theme.RADIUS_SMALL,
+            ).grid(row=0, column=2, padx=(4, 6), pady=(9, 2), sticky="e", ipadx=6, ipady=2)
+
         ctk.CTkLabel(
             card,
             text=event.get("time", "Time unavailable"),
-            font=(theme.FONT, 9),
+            font=(theme.FONT, 12),
             text_color=theme.TEXT_DIM,
             anchor="e",
-        ).grid(row=0, column=2, padx=(8, 14), pady=(11, 2), sticky="e")
+        ).grid(row=0, column=3, padx=(6, 14), pady=(11, 2), sticky="e")
 
         detail = event.get("detail", "")
         if detail:
             ctk.CTkLabel(
                 card,
                 text=detail,
-                font=(theme.FONT, 9),
+                font=(theme.FONT, 12),
                 text_color=theme.TEXT_MUTED,
                 anchor="w",
                 justify="left",
-                wraplength=760,
-            ).grid(row=1, column=1, columnspan=2, padx=(0, 14), pady=(0, 11), sticky="ew")
+                wraplength=860,
+            ).grid(row=1, column=1, columnspan=3, padx=(0, 14), pady=(0, 11), sticky="ew")
         else:
             ctk.CTkLabel(
                 card,
                 text=event.get("category", "Activity"),
-                font=(theme.FONT, 9),
+                font=(theme.FONT, 12),
                 text_color=theme.TEXT_DIM,
                 anchor="w",
-            ).grid(row=1, column=1, columnspan=2, padx=(0, 14), pady=(0, 11), sticky="w")
+            ).grid(row=1, column=1, columnspan=3, padx=(0, 14), pady=(0, 11), sticky="w")

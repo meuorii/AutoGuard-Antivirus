@@ -58,10 +58,15 @@ class ThreatsPage(BasePage):
 
     def handle_message(self, message) -> None:
         if message.kind == "threat_details_requested":
-            self._detail_ref = message.payload.get("threat_ref")
-            if self._detail_ref:
+            requested_ref = str(message.payload.get("threat_ref") or "").strip()
+            if requested_ref:
+                self._detail_ref = requested_ref
+                self._detail_data = None
                 self._loading = True
                 self._render_details_loading()
+                # Safe if on_show() already requested this read: the controller
+                # deduplicates active task names through _submit_once().
+                self.controller.load_threat_details(requested_ref)
         elif message.kind == "threat_details_data":
             if self._detail_ref:
                 result = dict(message.payload.get("result", {}))

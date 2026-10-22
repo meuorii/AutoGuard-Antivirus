@@ -244,6 +244,75 @@ class ScanHistory:
             ).fetchall()
         return ScanDetails(_session(row), tuple(_result(result) for result in results))
 
+    def recent_file_results(self, limit: int = 350) -> list[dict[str, object]]:
+        """Return recent scanned-file outcomes numbered per local calendar day.
+
+        ``detection_number`` restarts at 1 each local day (the first file scanned
+        today is #1). ``global_number`` keeps the all-time ordinal. Both derive from
+        durable insertion order, so neither changes on refresh or restart. Skipped
+        entries and directories are excluded.
+        """
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer.")
+        # Avoid ROW_NUMBER() over every persisted file (it grows with total scan
+        # history and made Activity time out). Count once, read only the newest
+        # rows, and derive each global ordinal from its distance to the newest.
+        with self.database.connection() as connection:
+            connection.execute("BEGIN")
+            total = int(connection.execute(
+                """SELECT COUNT(*) FROM scan_results
+                   WHERE result_category = 'SCANNED'
+                     AND entry_kind = 'file'
+                     AND detection_status IS NOT NULL"""
+            ).fetchone()[0])
+            rows = connection.execute(
+                """SELECT sr.*,
+                          ss.scan_type AS activity_scan_type,
+                          ss.source_path AS activity_source_path
+                   FROM scan_results AS sr
+                   JOIN scan_sessions AS ss ON ss.id = sr.session_id
+                   WHERE sr.result_category = 'SCANNED'
+                     AND sr.entry_kind = 'file'
+                     AND sr.detection_status IS NOT NULL
+                   ORDER BY sr.id DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            # The ordinal restarts every local calendar day. For each local day
+            # present in the rows, count the qualifying files recorded before that
+            # day began and subtract it from the global ordinal.
+            stored = [_result(row) for row in rows]
+            before_cache: dict[object, int] = {}
+
+            def before_day(moment: datetime) -> int:
+                local = moment.astimezone()
+                day = local.date()
+                if day not in before_cache:
+                    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+                    start_utc = start_local.astimezone(timezone.utc).isoformat(timespec="microseconds")
+                    before_cache[day] = int(connection.execute(
+                        """SELECT COUNT(*) FROM scan_results
+                           WHERE result_category = 'SCANNED'
+                             AND entry_kind = 'file'
+                             AND detection_status IS NOT NULL
+                             AND recorded_at < ?""",
+                        (start_utc,),
+                    ).fetchone()[0])
+                return before_cache[day]
+
+            output = []
+            for offset, (row, result) in enumerate(zip(rows, stored)):
+                global_number = total - offset
+                output.append({
+                    "result": result,
+                    "detection_number": max(1, global_number - before_day(result.recorded_at)),
+                    "global_number": global_number,
+                    "scan_type": ScanType(row["activity_scan_type"]),
+                    "source_path": row["activity_source_path"],
+                })
+        output.reverse()
+        return output
+
     def latest_detection_for_sha256(self, sha256: str) -> StoredScanResult | None:
         """Return the newest persisted detection result for exact content.
 

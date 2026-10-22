@@ -60,6 +60,7 @@ class MatchingCopyCleanup:
         if details is None: raise KeyError(f"Unknown threat incident: {incident_id}")
         if details.incident.status is IncidentStatus.RESOLVED: raise ValueError("Cannot clean matching copies for a RESOLVED incident.")
 
+        self._failure_events_recorded = 0
         expected_sha256 = details.incident.sha256
         roots = self._search_locations()
         locations_searched = tuple(str(path) for path in roots)
@@ -243,7 +244,23 @@ class MatchingCopyCleanup:
         normalized = normalize_path(path)
         return any(normalized == root or root in normalized.parents for root in roots)
 
+    # A single cleanup run can hit thousands of unreadable files (locked, cloud-only or
+    # permission-protected). Every failure is still counted in the cleanup result, but
+    # only the first few are written to the incident timeline so one run cannot add
+    # thousands of rows (7,000+ events broke the Threat Details page).
+    _MAX_FAILURE_EVENTS_PER_RUN = 25
+
     def _record_failure_event(self, incident_id: str, issue: CleanupIssue) -> None:
+        recorded = getattr(self, "_failure_events_recorded", 0)
+        if recorded > self._MAX_FAILURE_EVENTS_PER_RUN:
+            return
+        self._failure_events_recorded = recorded + 1
+        if recorded == self._MAX_FAILURE_EVENTS_PER_RUN:
+            issue = CleanupIssue(
+                issue.path,
+                f"More than {self._MAX_FAILURE_EVENTS_PER_RUN} files could not be checked during this cleanup. "
+                "Further failures are counted in the cleanup result but not recorded individually.",
+            )
         self.incidents.append_event(incident_id, IncidentEventType.MATCHING_CLEANUP_FAILED, path=issue.path, source=ScanSource.MATCHING_COPY, detection_reason=issue.reason)
 
 
